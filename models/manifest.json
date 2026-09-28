@@ -1,0 +1,16 @@
+{
+  "schema_version": "1.0",
+  "models": [
+    {
+      "name": "yolo11n-pose.pt",
+      "relative_path": "models/yolo11n-pose.pt",
+      "task": "pose",
+      "sha256": "869e83fcdffdc7371fa4e34cd8e51c838cc729571d1635e5141e3075e9319dc0",
+      "size_bytes": 6255593,
+      "source_url": "https://github.com/ultralytics/assets/releases/download/v8.3.0/yolo11n-pose.pt",
+      "ultralytics_version": "8.3.203",
+      "default_imgsz": 512,
+      "license": "AGPL-3.0"
+    }
+  ]
+}
