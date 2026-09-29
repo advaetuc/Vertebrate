@@ -7,6 +7,8 @@ import platform
 import struct
 import sys
 
+from lock_wheels import write_lock
+
 root = Path(__file__).resolve().parents[1]
 distributions = sorted(metadata.distributions(), key=lambda d: d.metadata['Name'].lower())
 packages = []
@@ -22,10 +24,6 @@ environment = {'python': sys.version, 'executable': sys.executable, 'base_execut
                'platform': platform.platform(), 'uname': platform.uname()._asdict(),
                'windows_version': list(sys.getwindowsversion()), 'pointer_bits': struct.calcsize('P') * 8,
                'logical_processors_reported_by_os': os.cpu_count(), 'packages': packages}
+count = write_lock(root, root / 'runtime/wheelhouse')
 (root / 'reports/environment.json').write_text(json.dumps(environment, indent=2) + '\n', encoding='utf-8')
-lock = ['# Resolved on Windows AMD64 / CPython 3.12.0. Includes build and test tools.',
-        '# CPU PyTorch builds are intentional. Install project separately with --no-deps.',
-        '--extra-index-url https://download.pytorch.org/whl/cpu', '']
-lock += [f"{p['name']}=={p['version']}" for p in packages if p['name'] != 'vertebrate']
-(root / 'requirements-win-cpu.lock').write_text('\n'.join(lock) + '\n', encoding='utf-8')
-print(f'Recorded {len(packages)} distributions; locked {len(packages) - 1} third-party packages.')
+print(f'Recorded {len(packages)} distributions; hash-locked {count} third-party packages.')

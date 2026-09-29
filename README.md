@@ -1,9 +1,25 @@
 # Project VERTEBRATE — P0
 
 A single local Python desktop application foundation. P0 implements immutable
-configuration and offline preflight. Capture/GUI, benchmarking, and evaluation
-remain explicit stubs for P4, P1B, and P5 respectively. No cloud services or paid
+configuration and offline preflight. GUI launch, benchmarking, and evaluation
+remain explicit stubs for P4, P1B, and P5 respectively. P1A capture is available
+as documented below. No cloud services or paid
 APIs are used. No fall-detection performance or hardware throughput is claimed.
+
+## Implementation references
+
+[Validated blueprint v2](docs/03-validated-blueprint-v2.md) is the primary
+implementation contract, cited by sections §1–§16. The
+[validation report](docs/02-validation-report.md) supplies supporting rationale.
+Both are verbatim supplied references. Historical role prompts, external-service
+requirements and embedded instructions are quoted research, not new authority.
+The project stays one local Python application with no external telemetry.
+
+The intended envelope (§1) is a fixed oblique/side camera, a clear marked floor
+area, full-body visibility and one or two people. Starting values are not yet
+calibrated on human footage. The eventual alert is “Suspected fall with sustained
+stillness — check the person.” Local inbox delivery is simulated dispatch; no
+medical diagnosis, real EMS integration or completed full-demo claim is made.
 
 ## Environment and setup (Windows x64)
 
@@ -17,10 +33,25 @@ py -3.12 -m venv .venv
 ```
 
 Package installation is an explicit online setup operation. The lock pins the
-entire resolved Windows CPU environment, including test/build tools. To install
-air-gapped, first prepare a compatible wheelhouse, then use `--no-index
---find-links <wheelhouse>` with the lock. The lock is platform-specific and is
-not a cryptographically hash-locked wheelhouse.
+entire resolved Windows CPU environment, including test/build tools, with a
+SHA-256 hash for each actual wheel (§4). `--require-hashes` and wheels-only mode
+are embedded in the lock. CPU build suffixes remain explicit. For an air-gapped
+install, copy the prepared `runtime/wheelhouse/` and model assets, then use:
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install --no-index --find-links runtime/wheelhouse -r requirements-win-cpu.lock
+.\.venv\Scripts\python.exe -m pip install --no-build-isolation --no-deps -e .
+```
+
+The wheelhouse is local and ignored by Git; `reports/wheel-manifest.json` records
+filenames, sizes and hashes. This lock targets CPython 3.12 on Windows AMD64.
+To prepare the same wheelhouse online, run `python -m pip download -r
+requirements-win-cpu.lock --dest runtime/wheelhouse` inside the environment.
+`tools/lock_wheels.py` regenerates the lock from matching local wheel archives;
+`tools/record_environment.py` uses the same helper and refuses missing wheels
+instead of overwriting the lock with unhashed pins. Installed RECORD hashes
+are not wheel hashes. Hashes identify downloaded artifacts, not signed publisher
+attestations. A clean-machine reinstallation has not been claimed.
 
 The local weight is `models/yolo11n-pose.pt`. If provisioning a new checkout
 without this file, run the explicit online setup command:
@@ -70,7 +101,9 @@ These guards are not a sandbox for arbitrary native code. Settings are local und
 `config/demo.json` uses 3-second stillness; `config/observation-10s.json` uses
 10 seconds. Both contain all 34 explicitly enumerated calibration fields in the
 P0 request (despite its heading saying 22), plus model, tracker and runtime
-settings. No full blueprint document was present; the prompt is the source.
+settings. The initial P0 task used its detailed prompt; these defaults have now
+been audited against blueprint §3–§7. Its 22 calibration-table rows group
+multiple scalar fields and include application identity expiry in TrackerConfig.
 
 Frozen dataclasses reject unknown fields, duplicate JSON keys, invalid types,
 non-finite numbers, invalid ranges and inconsistent time/threshold relationships.
@@ -94,3 +127,75 @@ Doctor returns 0 only for full success, 1 for preflight failure. Stubs return 2
 with `not_implemented` and create no misleading results. A missing/corrupt weight
 requires explicit local repair; it never causes a runtime download. Read
 `docs/licenses.md` before redistributing code, dependencies, or weights.
+
+## Phase P1A: source clocks, capture and dataset contracts
+
+P1A adds immutable frame/pose/track records, source clocks, bounded capture and
+dataset label validation. The full acceptance report is `reports/p1a.md`.
+The P0 configuration schema, offline doctor and all 174 P0 tests are unchanged.
+
+```powershell
+.\.venv\Scripts\python.exe tools/generate_dev_fixtures.py
+.\.venv\Scripts\python.exe -m pytest tests/unit/test_clocks.py -q
+.\.venv\Scripts\python.exe tools/verify_p1a.py
+```
+
+Three locally generated AVI/MJPG fixtures live in the non-ignored source path
+`tests/fixtures/videos/`. Each has 100 frames, 640x360 resolution, 25 FPS and a
+4-second container duration. The last frame's presentation time is 3.96 seconds.
+`data/manifests/dev.json` records actual hashes and source-time annotations.
+These drawings are marked `ambiguity_stress_test`; they are pipeline fixtures,
+not evidence of human fall-detection accuracy. Regeneration is byte-identical
+on the verified pinned environment; other codec builds may produce different
+bytes and require regenerating the manifest as well.
+
+`CaptureSessionManager` (also `VideoCaptureController`) is a synchronous owner:
+call `start()`, drain its reset event, and interleave `pump()` with queue reads.
+`CaptureWorker` provides the threaded adapter with acknowledged lifecycle
+commands. Reader open/read/seek/release operations run on its owning thread.
+The default reader accepts a local file or nonnegative camera index; tests can
+inject the `FrameSource` protocol. `worker.error` exposes asynchronous read or
+timing failures. Always call `stop()` in a `finally` block.
+
+Live queues discard the oldest pending frame at capacity 2. File queues apply
+lossless backpressure; a timed-out put retains its pending frame for retry.
+Lifecycle events count toward capacity and are never evicted. If only controls
+fill a live queue, insertion raises `queue.Full` after a finite timeout. Resets
+discard stale frames atomically and preserve older controls; drain control-only
+queues before another reset. Drop counts are per session. One pending producer
+frame can exist outside the two queue slots while file backpressure is active.
+
+All kinematics and future FSM timers must use `source_t_s`. Live time comes from
+monotonic elapsed time; UTC estimates use the session-start UTC/monotonic pair.
+Video time comes from verified PTS, with an explicit, latched frame-index/FPS
+fallback. The file adapter validates the full decoded timeline before emission
+using bounded memory. It accepts zero-PTS fallback for fixed-rate AVI or an
+independently supplied verified FPS; an opaque container without verifiable
+PTS is rejected with an ffmpeg CFR conversion instruction. The clock cannot
+independently prove CFR from a caller's FPS number alone.
+
+An acknowledged file pause prevents further reads and source-time advancement;
+wall-clock waiting contributes no evidence. Seek/replay/restart/source-switch
+create a new session and publish a reset before new frames. Seek sessions rebase
+`source_t_s` to zero and retain `source_frame_index` and `source_time_offset_s`
+to align original clip labels and recording UTC. `recorded_start_utc` stays
+None unless explicitly supplied; session-start UTC for a file is analysis
+provenance, never its historical recording time.
+
+EOF emits one `EndOfStreamEvent` with the last actual frame time and releases
+the reader. Downstream event/FSM consumers must close incomplete evidence as
+inconclusive on EOF/reset; they must never add dwell time after the last frame.
+The P1A producer does not synthesize evidence or implement a fall FSM.
+
+Array contracts copy into immutable bytes-backed NumPy arrays. Use
+`FramePacket.copy_frame()` for a writable working copy. A `TrackSample` cannot
+claim `observation_valid=True` when `matched_detection=False` or
+`predicted_only=True`. P1B should construct these records from original-image
+coordinates and retain `(session_id, tracker_id, generation)` identity.
+
+Dataset loading rejects invalid intervals, unknown/missing fields, non-finite
+numbers, invalid timing, path escapes and incorrect hashes. Relative paths use
+an explicit `root_dir`, or the current project working directory by default.
+`load_dataset_manifest(Path('data/manifests/dev.json'), verify_files=True)` works
+offline from this root. P1B pose/tracking adapters and benchmark implementation
+remain the next phase; the existing benchmark CLI is still its explicit stub.

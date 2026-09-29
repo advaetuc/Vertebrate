@@ -1,5 +1,15 @@
 # VERTEBRATE Phase P0 baseline
 
+> Alignment addendum (2026-09-29): the authoritative blueprint and validation
+> report are now preserved verbatim under `docs/`. The original record below is
+> historical evidence, including the initial absence of the full blueprint and
+> version-only lock. Blueprint §4 requires wheel hashes; the current lock now
+> includes SHA-256 hashes for all 47 actual Windows CPU wheels, and its helper
+> refuses to replace it with unhashed pins. Versions, configuration values and
+> model assets are unchanged. See [the alignment audit](p0-alignment-audit.md)
+> for the new wheel inventory and rerun acceptance evidence. This supersedes
+> the historical version-lock limitation without rewriting past test results.
+
 Recorded 2026-09-28. **P0 acceptance: PASS.** No benchmarks or detection-accuracy
 claims were produced. All verification used the project virtual environment.
 

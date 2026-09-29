@@ -1,2 +1,5 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+# Preserve supplied implementation references byte-for-byte across checkouts.
+docs/03-validated-blueprint-v2.md -text
+docs/02-validation-report.md -text
