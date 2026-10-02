@@ -121,7 +121,7 @@ def _prepare_ultralytics(root: Path) -> None:
     (folder / 'settings.json').write_text(json.dumps(settings, indent=2), encoding='utf-8')
 
 
-def _check_dependencies() -> str:
+def _check_dependencies(*, include_qt: bool = True) -> str:
     opencv = sorted(d.metadata['Name'] for d in metadata.distributions()
                     if re.sub(r'[-_.]+', '-', d.metadata.get('Name', '').lower()).startswith('opencv-'))
     if opencv != ['opencv-python']:
@@ -132,6 +132,8 @@ def _check_dependencies() -> str:
                                  ('lap', 'lap'), ('PySide6.QtCore', 'PySide6'),
                                  ('PySide6.QtGui', 'PySide6'), ('PySide6.QtWidgets', 'PySide6'),
                                  ('ultralytics', 'ultralytics')):
+        if not include_qt and module.startswith('PySide6.'):
+            continue
         importlib.import_module(module)
         versions[distribution] = metadata.version(distribution)
     import torch

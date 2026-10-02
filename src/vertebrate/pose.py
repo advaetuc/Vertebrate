@@ -68,7 +68,7 @@ Non-finite keypoints become zero placeholders with a false validity mask.
 
 
 class PoseAdapter:
-    def __init__(self, config: AppConfig, root_dir: Path | None = None):
+    def __init__(self, config: AppConfig, root_dir: Path | None = None, *, headless: bool = False):
         self.config = config
         self.root = (root_dir or Path.cwd()).resolve()
         self.network_attempts: list[str] = []
@@ -84,7 +84,10 @@ class PoseAdapter:
                 raise AssetVerificationError('Configured model_path differs from verified asset')
             started = perf_counter()
             _prepare_ultralytics(self.root)
-            _check_dependencies()
+            if headless:
+                _check_dependencies(include_qt=False)
+            else:
+                _check_dependencies()
             from ultralytics import YOLO
             self.model = YOLO(str(self.asset.path), task='pose')
             self.model.to('cpu').model.float()
