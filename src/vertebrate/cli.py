@@ -241,6 +241,8 @@ def main(argv: list[str] | None = None) -> int:
     benchmark.add_argument('--manifest', default='data/manifests/dev.json')
     benchmark.add_argument('--device', default='cpu')
     benchmark.add_argument('--output', default='reports/benchmark.json')
+    benchmark.add_argument('--config', default='config/demo.json')
+    benchmark.add_argument('--imgsz', type=int, nargs='+', default=[416, 512, 640])
     evaluate = sub.add_parser('evaluate')
     evaluate.add_argument('--manifest', default='data/manifests/holdout.json')
     evaluate.add_argument('--config', default='config/demo.json')
@@ -253,7 +255,20 @@ def main(argv: list[str] | None = None) -> int:
             result = run_doctor(args.config, args.manifest)
         print(json.dumps(asdict(result), indent=2))
         return 0 if result.status == Status.PASS else 1
-    if args.command in ('benchmark', 'evaluate'):
+    if args.command == 'benchmark':
+        try:
+            with redirect_stdout(sys.stderr):
+                from .benchmark import run_benchmark
+                report = run_benchmark(args.manifest, args.device, args.output, args.config, args.imgsz)
+            print(json.dumps({'status': report['status'], 'output': args.output,
+                              'network_attempts': report['network_attempts'],
+                              'runs': [{k: run[k] for k in ('imgsz', 'frames', 'processed_fps', 'dropped_frames')}
+                                       for run in report['runs']]}, indent=2, allow_nan=False))
+            return 0
+        except Exception as exc:
+            print(json.dumps({'status': Status.FAIL, 'error': f'{type(exc).__name__}: {exc}'}))
+            return 1
+    if args.command == 'evaluate':
         print(json.dumps({'status': Status.NOT_IMPLEMENTED,
                           'message': 'Not implemented until ' + ('P1B' if args.command == 'benchmark' else 'P5')}))
         return 2

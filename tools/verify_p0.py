@@ -25,5 +25,5 @@ for command in commands:
 stamp = datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%dT%H%M%SZ')
 target = root / 'reports' / f'verification-{stamp}.json'
 target.write_text(json.dumps(records, indent=2) + '\n', encoding='utf-8')
-expected = [0, 0, 0, 0, 2, 2, 2]
+expected = [0, 0, 0, 0, 2, 0, 2]  # Benchmark implemented in P1B; GUI/evaluate remain stubs.
 raise SystemExit(0 if [r['exit_code'] for r in records] == expected else 1)

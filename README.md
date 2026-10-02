@@ -1,10 +1,11 @@
-# Project VERTEBRATE — P0
+# Project VERTEBRATE — P1B
 
 A single local Python desktop application foundation. P0 implements immutable
-configuration and offline preflight. GUI launch, benchmarking, and evaluation
-remain explicit stubs for P4, P1B, and P5 respectively. P1A capture is available
-as documented below. No cloud services or paid
-APIs are used. No fall-detection performance or hardware throughput is claimed.
+configuration and offline preflight. P1A provides capture and source clocks;
+P1B adds CPU pose, ByteTrack association and a measured offline benchmark.
+GUI launch and evaluation remain explicit stubs for P4 and P5. No cloud services
+or paid APIs are used. Synthetic throughput measurements do not establish
+fall-detection accuracy or live-camera performance.
 
 ## Implementation references
 
@@ -74,7 +75,7 @@ recorded at download detects subsequent corruption, not independent provenance.
 .\.venv\Scripts\vertebrate.exe doctor --offline
 ```
 
-`tools/verify_p0.py` runs these gates and the three stubs, retaining stdout,
+`tools/verify_p0.py` runs these gates, benchmark and the two remaining stubs, retaining stdout,
 stderr, and actual exit codes in dated JSON reports. Integration tests require
 real local weights and installed dependencies; they fail when absent.
 
@@ -197,5 +198,48 @@ Dataset loading rejects invalid intervals, unknown/missing fields, non-finite
 numbers, invalid timing, path escapes and incorrect hashes. Relative paths use
 an explicit `root_dir`, or the current project working directory by default.
 `load_dataset_manifest(Path('data/manifests/dev.json'), verify_files=True)` works
-offline from this root. P1B pose/tracking adapters and benchmark implementation
-remain the next phase; the existing benchmark CLI is still its explicit stub.
+offline from this root.
+
+## Phase P1B: pose, association and benchmark
+
+`PoseAdapter(config)` verifies local asset size/hash before constructing YOLO,
+then performs CPU float32 batch-one inference. Call `warmup()` before measuring
+steady processing and `infer(FramePacket)` to obtain an immutable
+`PoseObservation`. Ultralytics postprocessing already undoes letterboxing;
+the adapter uses those original-image coordinates directly. Non-finite or
+subpixel boxes are discarded. Invalid keypoints retain a false mask, with
+non-finite coordinates replaced by zero placeholders. A usable landmark must
+be finite, inside the original image, and at least the configured confidence.
+
+`ByteTrackManager(config.tracker)` accepts observations via `update()` and reset/
+EOF events via `handle_event()`. The pinned ByteTrack implementation renumbers
+detections after high/low confidence filtering. The adapter preserves original
+row indices through both passes using its `init_track` override. Only a matched
+current detection emits a valid sample; predictions never refresh evidence.
+A match gap strictly greater than 0.75 source-seconds increments the application
+generation. Reset creates a new tracker; EOF closes it. Old-session observations
+are rejected. Use one vision owner: Ultralytics numeric IDs and the offline
+Python guards are process-global. Capture can run on its separate reader thread.
+
+```powershell
+.\.venv\Scripts\python.exe -m vertebrate benchmark --manifest data/manifests/dev.json --device cpu --output reports/benchmark.json
+.\.venv\Scripts\python.exe tools/verify_p1b.py
+```
+
+Benchmark defaults to sizes 416, 512 and 640; `--imgsz 512` selects one size and
+`--config config/demo.json` selects the configuration. Each run processes every
+frame of all hash-verified development clips through the real serial capture,
+pose and tracking pipeline, using the bounded file queue without dropping.
+Full CFR scanning, model load and a single warmup frame are reported separately.
+Stage and total timings include copies and offline-guard overhead. Reported
+processed FPS excludes startup, warmup, EOF and report writing; frame age measures
+local acquisition to completion, not camera latency or historical recording age.
+Later model loads share process/OS caches. No outlier removal is applied.
+
+`reports/benchmark.json` contains measured timings, provenance, frame counts,
+keypoint availability and track/generation counts; `reports/p1b.md` records
+acceptance evidence. An undefined availability ratio is null. Synthetic drawings
+may produce zero people, so these clips cannot validate pose quality, human
+tracking stability, fall/ADL behavior or choose a release input size. Controlled
+detection tests separately exercise the real tracker and letterbox postprocessor.
+Feature extraction and the fall state machine remain for subsequent phases.
