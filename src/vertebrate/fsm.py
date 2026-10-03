@@ -30,6 +30,7 @@ class CandidateAlert:
     confirmed_source_t_s: float
     sequence: int
     peak_v_h0_per_s: float
+    stillness_start_source_t_s: float | None = None
 
 
 @dataclass(frozen=True)
@@ -215,7 +216,8 @@ class PersonFSM:
             self.state = State.ALERTED
             self._event_number += 1
             self.incident_id = str(uuid5(NAMESPACE_URL, repr((self.person_key, self._event_number, self._onset))))
-            alert = CandidateAlert(self.incident_id, self.person_key, self._onset, self._down_time, t, sequence, self._peak_v)
+            alert = CandidateAlert(self.incident_id, self.person_key, self._onset, self._down_time, t, sequence,
+                                   self._peak_v, self._still_start)
             return self._decision('suspected_fall_with_sustained_stillness', alert=alert)
         return self._decision('stillness')
 

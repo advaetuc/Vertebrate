@@ -179,6 +179,7 @@ class FeatureSummary:
     stillness_pair_dt_s: float | None
     drift_pair_dt_s: float | None
     history_reset: bool
+    common_core_keypoints: int | None = None
 
 
 def _geometry(sample, S, H, baseline, config):
@@ -260,7 +261,7 @@ call invalidate() when no TrackSample exists. No absent frame is interpolated.
         while self._motion and sample.source_t_s - self._motion[0][0].source_t_s > horizon + 1e-12:
             self._motion.popleft()
         v = normalized_velocity(*zip(*self._velocity), baseline.H0, c) if baseline else None
-        m = b = pair_dt = drift_dt = None
+        m = b = pair_dt = drift_dt = common_count = None
         if baseline:
             pairs = []
             common = mask.copy()
@@ -271,9 +272,9 @@ call invalidate() when no TrackSample exists. No absent frame is interpolated.
                         and common[list(CORE)].all() and common[list(LEGS)].sum() >= 2):
                     indices = [*CORE, *(i for i in LEGS if common[i])]
                     speed = float(np.median(np.linalg.norm(sample.keypoints_xy[indices] - previous.keypoints_xy[indices], axis=1)) / (baseline.H0 * dt))
-                    pairs.append((abs(dt - c.stillness_pair_target_dt_s), dt, speed))
+                    pairs.append((abs(dt - c.stillness_pair_target_dt_s), dt, speed, len(indices)))
             if pairs:
-                _, pair_dt, m = min(pairs)
+                _, pair_dt, m, common_count = min(pairs)
             prior = [(abs(sample.source_t_s - p.source_t_s - 1), p) for p, _ in self._motion
                      if c.one_second_min_dt_s - 1e-12 <= sample.source_t_s - p.source_t_s <= c.one_second_max_dt_s + 1e-12]
             if prior:
@@ -282,4 +283,4 @@ call invalidate() when no TrackSample exists. No absent frame is interpolated.
                 drift_dt = sample.source_t_s - p.source_t_s
         return FeatureSummary(sample.person_key, sample.sequence, sample.source_t_s, baseline, S, H, Sf, Hf,
                               _geometry(sample, S, H, baseline, c), _geometry(sample, Sf, Hf, baseline, c),
-                              v, m, b, pair_dt, drift_dt, reset)
+                              v, m, b, pair_dt, drift_dt, reset, common_count)
