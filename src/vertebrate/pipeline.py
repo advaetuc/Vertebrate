@@ -38,7 +38,7 @@ class PipelineResult:
 class HeadlessPipeline:
     def __init__(self, config: AppConfig | None = None, root_dir: Path | None = None,
                  *, pose: PoseEstimator | None = None, tracker: SessionTracker | None = None,
-                 frame_rate: float = 30):
+                 frame_rate: float = 30, on_alert=None, retain_history: bool = True):
         self.config = config or AppConfig()
         self.root = Path(root_dir or Path.cwd()).resolve()
         self.pose = pose  # lazy: recorded-pose replay does not require loading YOLO
@@ -56,8 +56,12 @@ class HeadlessPipeline:
         self.frames = 0
         self.alerts = []
         self.transitions = []
+        self.on_alert = on_alert
+        self.retain_history = retain_history
 
     def _record(self, fsm, decision, previous):
+        if not self.retain_history:
+            return
         if decision.alert is not None:
             self.alerts.append(decision.alert)
         if previous != decision.state or decision.inconclusive or decision.alert or fsm.closed:
@@ -175,6 +179,8 @@ class HeadlessPipeline:
             decision = fsm.update(features, recovery_valid=all(
                 sample.keypoint_valid_mask[i] and sample.keypoint_confidences[i] >= self.config.calibration.keypoint_confidence
                 for i in (15, 16)))
+            if decision.alert is not None and self.on_alert is not None:
+                self.on_alert(decision.alert, features)
             if decision.reset_baseline:
                 extractor.reset()
             if sample.observation_valid and sample.matched_detection and not sample.predicted_only:
@@ -222,3 +228,11 @@ class HeadlessPipeline:
             raise RuntimeError(f'Unexpected offline attempts: {attempts}')
         return PipelineResult(self.frames, worker.queue.dropped_frames_count,
                               tuple(self.alerts), tuple(self.transitions), tuple(attempts))
+
+
+def __getattr__(name):
+    # Keep the sequential evaluation path independent of Qt imports.
+    if name in ('ThreadedPipeline', 'LatestResultSlot', 'DisplayResult', 'PipelineStatus'):
+        from .gui import workers
+        return getattr(workers, name)
+    raise AttributeError(name)

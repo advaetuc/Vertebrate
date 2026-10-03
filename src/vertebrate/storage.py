@@ -123,16 +123,46 @@ class StorageWorker:
         self._startup_error = None
         self._owner = None
 
-    def start(self):
+    def start(self, *, thread_factory=Thread, wait_ready=True):
         if self._thread is not None:
             raise StorageError('Writer can only be started once')
-        self._thread = Thread(target=self._run, name='vertebrate-storage', daemon=True)
+        self._thread = thread_factory(target=self._run, name='vertebrate-storage', daemon=True)
         self._thread.start()
+        if not wait_ready:
+            return self
         if not self._ready.wait(10):
             raise StorageError('Storage startup timed out')
         if self._startup_error:
             raise StorageError(str(self._startup_error)) from self._startup_error
         return self
+
+    @property
+    def ready(self):
+        return self._ready.is_set()
+
+    @property
+    def startup_error(self):
+        return self._startup_error
+
+    @property
+    def unsaved_incident_ids(self):
+        with self._lock:
+            return tuple(self._requests)
+
+    def request_stop(self):
+        """Nonblocking cancellation; the owner drains accepted writes before exit."""
+        with self._lock:
+            self._stop.set()
+
+    def reopen(self, *, thread_factory=Thread, wait_ready=True):
+        """Restart a fully stopped owner without losing retained failed requests."""
+        if self._thread is None or self._thread.is_alive() or not self._stop.is_set():
+            raise StorageError('Reopen requires a fully stopped writer')
+        self._thread = None
+        self._stop.clear()
+        self._ready.clear()
+        self._startup_error = None
+        return self.start(thread_factory=thread_factory, wait_ready=wait_ready)
 
     def record(self, incident_id) -> StorageRecord:
         with self._lock:
@@ -255,8 +285,7 @@ class StorageWorker:
         return future
 
     def stop(self, timeout_s=10):
-        with self._lock:
-            self._stop.set()
+        self.request_stop()
         if self._thread:
             self._thread.join(timeout_s)
             if self._thread.is_alive():
