@@ -17,7 +17,7 @@ from PySide6.QtCore import QCoreApplication, QObject, QThread, QTimer, Slot
 
 from ..capture import CaptureSessionManager
 from ..config import AppConfig
-from ..contracts import EndOfStreamEvent, FramePacket, SessionResetEvent
+from ..contracts import EndOfStreamEvent, FramePacket, PoseObservation, SessionResetEvent
 from ..incidents import IncidentFactory
 from ..pipeline import HeadlessPipeline
 from ..storage import StorageError, StorageWorker
@@ -36,12 +36,22 @@ class PipelineStatus:
 class DisplayResult:
     frame: FramePacket
     decisions: tuple
+    observation: PoseObservation | None = None
+    processing_fps: float = 0.
+    source_fps: float = 0.
+    stillness: tuple = ()
 
     def __post_init__(self):
         # FramePacket takes its own immutable bytes-backed copy. A painter can
         # call copy_frame() when it needs a writable/QImage-owned buffer.
         object.__setattr__(self, 'frame', replace(self.frame))
         object.__setattr__(self, 'decisions', tuple(self.decisions))
+        if self.observation is not None and (
+                self.observation.session_id, self.observation.sequence, self.observation.source_t_s,
+                self.observation.width, self.observation.height) != (
+                self.frame.session_id, self.frame.sequence, self.frame.source_t_s,
+                self.frame.width, self.frame.height):
+            raise ValueError('Display overlay must match the frame sequence and source')
 
 
 class LatestResultSlot:
@@ -248,6 +258,7 @@ Factories are called in their owning workers, permitting hardware-free tests.
             if self._cancel.is_set():
                 return
             self.capture.start()
+            self._source_fps = self.capture._reader.fps
             self._capture_ready.set()
             while not self._cancel.is_set():
                 try:
@@ -260,6 +271,8 @@ Factories are called in their owning workers, permitting hardware-free tests.
                     continue
                 try:
                     _resolve(future, getattr(self.capture, name)(*args))
+                    if self.capture._reader is not None:
+                        self._source_fps = self.capture._reader.fps
                 except Exception as exc:
                     _resolve(future, error=exc)
                 finally:
@@ -328,9 +341,14 @@ Factories are called in their owning workers, permitting hardware-free tests.
                         pipe._retired_sessions.clear()
                         factory = IncidentFactory()
                         self.latest.set(None)
+                    started = time.perf_counter()
                     decisions = pipe.process(current)
                     if isinstance(current, FramePacket):
-                        self.latest.set(DisplayResult(current, decisions))
+                        elapsed = time.perf_counter() - started
+                        stillness = tuple((key, max(0., current.source_t_s - fsm._still_start))
+                            for key, (_, fsm) in pipe._people.items() if fsm._still_start is not None)
+                        self.latest.set(DisplayResult(current, decisions, pipe.last_observation,
+                            1 / elapsed if elapsed > 0 else 0., getattr(self, '_source_fps', 0.), stillness))
                         self.latest.update_status(frames=pipe.frames,
                             dropped_frames=self.capture.queue.dropped_frames_count)
                     elif isinstance(current, EndOfStreamEvent) and not self._faulted.is_set() and not self._cancel.is_set():

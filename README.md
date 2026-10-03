@@ -1,9 +1,9 @@
-# Project VERTEBRATE — P1B
+# Project VERTEBRATE — P4B
 
 A single local Python desktop application foundation. P0 implements immutable
 configuration and offline preflight. P1A provides capture and source clocks;
 P1B adds CPU pose, ByteTrack association and a measured offline benchmark.
-GUI launch and evaluation remain explicit stubs for P4 and P5. No cloud services
+P4B adds the desktop workflow and local inbox. Evaluation remains a P5 stub. No cloud services
 or paid APIs are used. Synthetic throughput measurements do not establish
 fall-detection accuracy or live-camera performance.
 
@@ -243,3 +243,30 @@ may produce zero people, so these clips cannot validate pose quality, human
 tracking stability, fall/ADL behavior or choose a release input size. Controlled
 detection tests separately exercise the real tracker and letterbox postprocessor.
 Feature extraction and the fall state machine remain for subsequent phases.
+# P4B desktop workflow
+
+Run `.\.venv\Scripts\python.exe -m vertebrate` to open the local desktop, or
+preselect a file with `--source tests/fixtures/videos/dev_empty_scene.avi`.
+Use a numeric `--source 0` for a camera. Press Start to begin; file Pause/Resume
+preserves source time, while Replay creates a fresh session. Profile/context
+edits are available while stopped and advance the configuration revision.
+
+The video timer polls one immutable frame/overlay result. Processing FPS is the
+observed vision processing rate, separate from container/camera FPS (shown as
+unavailable when the driver does not report it). The inbox reads snapshots and
+metadata and queues acknowledgements through the single storage owner. A save
+failure remains visible and can be retried. Closing waits for cooperative owner
+shutdown; a blocked driver reports a timeout while the window stays open.
+
+GUI tests use the pinned test extra `pytest-qt==4.5.0` (MIT). Its wheel hash is in
+`requirements-win-cpu.lock`; P4B setup used one explicitly approved download.
+Application operation and acceptance tests remain offline. In PowerShell:
+
+```powershell
+$env:QT_QPA_PLATFORM = 'offscreen'
+.\.venv\Scripts\python.exe -m pytest tests/gui -q
+```
+
+Windows offscreen tests register installed Segoe UI/Times New Roman fonts when
+Qt exposes no font families. No font files are bundled. Automated camera tests
+use injected readers; they do not establish physical camera compatibility.

@@ -9,3 +9,4 @@ data/videos/
 *.egg-info/
 build/
 dist/
+runtime/setup-wheels/

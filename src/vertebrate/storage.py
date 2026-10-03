@@ -168,6 +168,25 @@ class StorageWorker:
         with self._lock:
             return self._records[incident_id]
 
+    @property
+    def records(self):
+        with self._lock:
+            return tuple(self._records.values())
+
+    def read_incident(self, incident_id) -> Future:
+        """Read complete metadata/media on the single owner, never on the GUI."""
+        self._assert_running()
+        future = Future()
+        with self._lock:
+            self._assert_running()
+            if incident_id not in self._records:
+                raise StorageError('Unknown incident ID')
+            try:
+                self.queue.put_nowait(('read', incident_id, None, future))
+            except Full:
+                future.set_exception(StorageError('Storage busy; retry opening the incident'))
+        return future
+
     def _fault(self, message):
         with self._lock:
             self.faults.append(message)
@@ -367,6 +386,20 @@ class StorageWorker:
                 except Empty:
                     continue
                 deliver = future.set_running_or_notify_cancel()
+                if operation == 'read':
+                    try:
+                        folder = self.outbox / key
+                        incident = _read_complete(folder)
+                        media = (_contained(folder, incident.media.snapshot_path).read_bytes()
+                                 if incident.media.snapshot_path else None)
+                        if deliver:
+                            future.set_result((incident, media))
+                    except Exception as exc:
+                        if deliver:
+                            future.set_exception(StorageError(f'Read failed: {exc}'))
+                    finally:
+                        self.queue.task_done()
+                    continue
                 try:
                     if operation == 'save':
                         with self._lock:

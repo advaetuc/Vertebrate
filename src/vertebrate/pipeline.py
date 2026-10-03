@@ -58,6 +58,7 @@ class HeadlessPipeline:
         self.transitions = []
         self.on_alert = on_alert
         self.retain_history = retain_history
+        self.last_observation = None
 
     def _record(self, fsm, decision, previous):
         if not self.retain_history:
@@ -128,6 +129,7 @@ class HeadlessPipeline:
 
     def process_observation(self, observation: PoseObservation):
         self._check_frame(observation.session_id, observation.sequence, observation.source_t_s)
+        self.last_observation = observation
         try:
             return self.process_tracks(self.tracker.update(observation), sequence=observation.sequence,
                                        source_t_s=observation.source_t_s, frame_height=observation.height)

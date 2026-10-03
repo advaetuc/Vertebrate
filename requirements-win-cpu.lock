@@ -5,6 +5,9 @@
 --only-binary=:all:
 --require-hashes
 
+# pytest_qt-4.5.0-py3-none-any.whl (P4B GUI test dependency)
+pytest-qt==4.5.0 --hash=sha256:ed21ea9b861247f7d18090a26bfbda8fb51d7a8a7b6f776157426ff2ccf26eff
+
 # certifi-2026.7.22-py3-none-any.whl
 certifi==2026.7.22 --hash=sha256:62f22742b58a1a33014a2b6b706588a8d7e2a88ae7bd1a6ebe8c992928483775
 # charset_normalizer-3.5.1-cp312-cp312-win_amd64.whl

@@ -74,3 +74,6 @@ substantial bundled-library license text, which is retained in the environment
 report. Retain the original wheel notices when redistributing binaries; this
 short inventory does not replace them. No third-party license is represented as
 the license of VERTEBRATE itself.
+
+P4B adds the test-only dependency **pytest-qt 4.5.0 (MIT)**. Its license is
+retained in `.venv/Lib/site-packages/pytest_qt-4.5.0.dist-info/licenses/LICENSE`.

@@ -232,7 +232,7 @@ def run_doctor(config_path: str | Path = 'config/demo.json', manifest_path: str 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog='vertebrate', description='VERTEBRATE local desktop foundation')
-    parser.add_argument('--source', help='Reserved for P4 capture source')
+    parser.add_argument('--source', help='Local video path or numeric camera index')
     parser.add_argument('--config', default='config/demo.json')
     sub = parser.add_subparsers(dest='command')
     doctor = sub.add_parser('doctor', help='Offline preflight (always denies network)')
@@ -279,6 +279,6 @@ def main(argv: list[str] | None = None) -> int:
     except ConfigValidationError as exc:
         print(json.dumps({'status': Status.FAIL, 'error': str(exc)}))
         return 1
-    print(json.dumps({'status': Status.NOT_IMPLEMENTED, 'message': 'GUI launch not implemented until P4',
-                      'profile': cfg.profile, 'config_sha256': config_sha256(cfg)}))
-    return 2
+    from .gui.window import launch_gui
+    source = int(args.source) if args.source is not None and args.source.isdecimal() else args.source
+    return launch_gui(cfg, source, Path.cwd())

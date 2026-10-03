@@ -154,6 +154,9 @@ class OpenCVFrameSource:
             if not self._cap.isOpened():
                 raise CaptureError(f'Cannot open source: {self.source}')
             if type(self.source) is int:
+                import math
+                rate = self._cap.get(cv2.CAP_PROP_FPS)
+                self.fps = rate if math.isfinite(rate) and rate > 0 else 0.
                 return
             self.fps = self._cap.get(cv2.CAP_PROP_FPS)
             clock = VideoFileClock(self.fps)
