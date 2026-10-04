@@ -290,6 +290,41 @@ class FallPose:
             np.tile(xy, (n, 1, 1)), np.ones((n, 17)), np.ones((n, 17), bool))
 
 
+@pytest.mark.parametrize('frame_count', [70, 110])
+def test_optional_clips_two_people_real_writer_eof_and_postroll(tmp_path, frame_count):
+    """Injected pose, real FSM/Qt/disk/AVI: orchestration, not pose accuracy."""
+    import json
+    cfg = configuration(tmp_path)
+    cfg = replace(cfg, runtime=replace(cfg.runtime, enable_optional_clip=True))
+    pipe = ThreadedPipeline(cfg, ROOT, pipeline_factory=lambda c, r: HeadlessPipeline(
+        c, r, pose=FallPose(people=2), tracker=DirectTracker()))
+    reader = Reader('injected')
+    reader.frame_count = frame_count
+    try:
+        completed(pipe.start('injected', source_factory=lambda s: reader))
+        until(lambda: pipe.status.state in ('eof', 'error', 'storage_fault'))
+        assert pipe.status.state == 'eof', pipe.status
+        completed(pipe.stop())
+        records = scan_outbox(pipe.storage.outbox).incidents
+        assert len(records) == 2
+        for incident in records:
+            assert incident.media.clip_path == 'clip.avi'
+            folder = pipe.storage.outbox / incident.incident_id
+            metadata = json.loads((folder / 'clip-timestamps.json').read_text())
+            assert metadata['requested_end_s'] == incident.timing.confirmed_source_s + 3.
+            assert metadata['requested_start_s'] == incident.timing.fall_onset_source_s - 3.
+            times = [f['source_t_s'] for f in metadata['frames']]
+            assert times == sorted(set(times))
+            if frame_count == 70:
+                assert any('post-roll' in r for r in metadata['reasons'])
+            else:
+                assert times[-1] >= metadata['requested_end_s'] - .2 - 1e-9
+        assert pipe.storage.media_budget.used_bytes == 0
+    finally:
+        completed(pipe.stop())
+    assert pipe.status.network_attempts == () and pipe.running_threads == 0
+
+
 def test_confirmed_incident_crosses_to_single_writer_and_stop_drains(tmp_path):
     cfg = configuration(tmp_path)
     pipe = ThreadedPipeline(cfg, ROOT, pipeline_factory=lambda c, r: HeadlessPipeline(

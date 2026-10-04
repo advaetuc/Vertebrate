@@ -20,6 +20,7 @@ from .config import AppConfig, config_sha256, config_to_dict, load_config
 from .incidents import (Acknowledgement, Delivery, Incident, Media, incident_from_json,
                         incident_to_dict, incident_to_json, relative_path)
 from .validation import integer, utc_datetime
+from .recorder import ClipPayload, MediaBudget, FPS, WIDTH, HEIGHT
 
 
 class StorageError(RuntimeError):
@@ -67,6 +68,8 @@ def _read_complete(folder: Path) -> Incident:
             raise StorageError('Snapshot missing or not decodable')
     if incident.media.clip_path and not _contained(folder, incident.media.clip_path).is_file():
         raise StorageError('Declared clip is missing')
+    if incident.media.clip_timestamps_path:
+        json.loads(_contained(folder, incident.media.clip_timestamps_path).read_text(encoding='utf-8'))
     return incident
 
 
@@ -109,6 +112,10 @@ class StorageWorker:
         self.pause_acquisition = pause_acquisition
         self.queue = Queue(capacity)
         self.max_media_buffer_bytes = max_media_buffer_bytes
+        self.media_budget = MediaBudget(max_media_buffer_bytes)
+        self._clip_requests = {}
+        self._clip_futures = {}
+        self._clip_active = set()
         self.pause_requested = Event()
         self.faults = []
         self.startup_issues = ()
@@ -147,7 +154,7 @@ class StorageWorker:
     @property
     def unsaved_incident_ids(self):
         with self._lock:
-            return tuple(self._requests)
+            return tuple(dict.fromkeys((*self._requests, *self._clip_requests)))
 
     def request_stop(self):
         """Nonblocking cancellation; the owner drains accepted writes before exit."""
@@ -208,7 +215,7 @@ class StorageWorker:
         if (incident.configuration.profile, incident.configuration.revision) != (config.profile, config.revision):
             raise ValueError('Incident configuration does not match supplied snapshot')
         if incident.configuration.snapshot_path != 'config.json' or incident.media.clip_path is not None:
-            raise ValueError('P3 writes config.json and snapshot only; optional clips are a later phase')
+            raise ValueError('Submit config.json and snapshot first; attach optional clip through the writer')
         if incident.media.snapshot_path not in (None, 'snapshot.jpg'):
             raise ValueError('P3 snapshot path must be snapshot.jpg')
         snapshot_error = incident.media.snapshot_error
@@ -234,12 +241,18 @@ class StorageWorker:
                     return self._futures[incident.incident_id]
                 raise StorageError('Retained failed incident: use retry(incident_id)')
             if snapshot is not None:
-                if self._media_bytes + snapshot.nbytes > self.max_media_buffer_bytes:
+                try:
+                    self.media_budget.reserve(snapshot.nbytes)
+                except MemoryError:
                     snapshot_error = 'Snapshot not retained: media memory limit exceeded'
                     snapshot = None
                     fault = snapshot_error
                 else:
-                    snapshot = np.frombuffer(snapshot.tobytes(), dtype=np.uint8).reshape(snapshot.shape)
+                    try:
+                        snapshot = np.frombuffer(snapshot.tobytes(), dtype=np.uint8).reshape(snapshot.shape)
+                    except Exception:
+                        self.media_budget.release(snapshot.nbytes)
+                        raise
                     self._media_bytes += snapshot.nbytes
             pending = replace(incident, delivery=Delivery())
             self._records[incident.incident_id] = StorageRecord(pending, 'pending')
@@ -261,6 +274,8 @@ class StorageWorker:
 
     def retry(self, incident_id) -> Future:
         self._assert_running()
+        if incident_id in self._clip_requests and incident_id not in self._requests:
+            return self.attach_clip(self._clip_requests[incident_id])
         fault = None
         with self._lock:
             self._assert_running()
@@ -280,6 +295,44 @@ class StorageWorker:
                 self._records[incident_id] = StorageRecord(replace(record.incident, delivery=Delivery()), 'pending')
             except Full:
                 fault = 'Storage queue is full; alert retained for retry'
+                future.set_exception(StorageError(fault))
+        if fault:
+            self._fault(fault)
+        return future
+
+    def attach_clip(self, payload: ClipPayload) -> Future:
+        """Queue post-roll without delaying the original snapshot/JSON receipt.
+
+        Payloads share this writer's budget. On queue/disk failure they remain
+        retained and retryable, with the same visible acquisition pause policy.
+        """
+        self._assert_running()
+        if not isinstance(payload, ClipPayload):
+            raise ValueError('Expected immutable ClipPayload')
+        for frame in payload.frames:
+            base = frame.frame_bgr
+            while isinstance(base, np.ndarray):
+                base = base.base
+            if getattr(base, 'budget', None) is not self.media_budget:
+                raise ValueError('Clip must use the writer shared media budget')
+        future, fault = Future(), None
+        with self._lock:
+            self._assert_running()
+            key = payload.incident_id
+            if key not in self._records:
+                raise StorageError('Save incident before attaching clip')
+            if self._records[key].incident.session_id != payload.session_id:
+                raise ValueError('Clip session does not match incident')
+            previous = self._clip_futures.get(key)
+            if key in self._clip_active:
+                return previous
+            self._clip_requests[key] = payload
+            self._clip_futures[key] = future
+            try:
+                self.queue.put_nowait(('clip', key, None, future))
+                self._clip_active.add(key)
+            except Full:
+                fault = 'Storage queue full; optional clip retained for retry'
                 future.set_exception(StorageError(fault))
         if fault:
             self._fault(fault)
@@ -345,14 +398,73 @@ class StorageWorker:
             if not ok:
                 raise StorageError('JPEG encoder failed')
             self._atomic_write(_contained(folder, 'snapshot.jpg'), encoded.tobytes())
-            media = Media(snapshot_path='snapshot.jpg')
+            media = replace(media, snapshot_path='snapshot.jpg', snapshot_error=None)
         except Exception as exc:
-            media = Media(snapshot_path=None, snapshot_error=f'{type(exc).__name__}: {exc}')
+            media = replace(media, snapshot_path=None, snapshot_error=f'{type(exc).__name__}: {exc}')
         self._atomic_write(_contained(folder, 'config.json'),
                            (json.dumps(config_to_dict(config), sort_keys=True, indent=2, allow_nan=False) + '\n').encode())
         saved = replace(incident, media=media, delivery=Delivery(status='saved'))
         # JSON is the last rename and the only completeness marker.
         self._atomic_write(final, (incident_to_json(saved) + '\n').encode())
+        return saved
+
+    def _save_clip(self, key):
+        import cv2
+        payload = self._clip_requests[key]
+        folder = self.outbox / key
+        incident = _read_complete(folder)
+        if incident.media.clip_status in ('saved', 'truncated', 'unavailable'):
+            return incident  # Idempotent receipt; never re-encode or undo ack.
+        temporary = folder / f'.clip.{uuid4()}.tmp.avi'
+        writer = None
+        try:
+            if not payload.frames:
+                raise StorageError('; '.join(payload.reasons) or 'No clip frames available')
+            writer = cv2.VideoWriter(str(temporary), cv2.VideoWriter_fourcc(*'MJPG'), FPS, (WIDTH, HEIGHT))
+            if not writer.isOpened():
+                raise StorageError('MJPG/AVI codec unavailable')
+            for frame in payload.frames:
+                writer.write(frame.frame_bgr)
+            writer.release()
+            writer = None
+            # Some backends silently fail write(). Verify every frame locally.
+            reader = cv2.VideoCapture(str(temporary))
+            try:
+                count = 0
+                while True:
+                    ok, frame = reader.read()
+                    if not ok:
+                        break
+                    if frame.shape != (HEIGHT, WIDTH, 3):
+                        raise StorageError('Clip encoder returned incorrect dimensions')
+                    count += 1
+                if count != len(payload.frames):
+                    raise StorageError('Clip encoder produced incomplete or empty output')
+            finally:
+                reader.release()
+            with temporary.open('rb+') as stream:
+                os.fsync(stream.fileno())
+            os.replace(temporary, _contained(folder, 'clip.avi'))
+            self._atomic_write(_contained(folder, 'clip-timestamps.json'),
+                (json.dumps(payload.metadata(), indent=2, allow_nan=False) + '\n').encode())
+            media = replace(incident.media, clip_path='clip.avi', clip_timestamps_path='clip-timestamps.json',
+                            clip_status='truncated' if payload.truncated else 'saved', clip_error=None)
+        except Exception as exc:
+            media = replace(incident.media, clip_path=None, clip_timestamps_path=None,
+                            clip_status='unavailable', clip_error=f'{type(exc).__name__}: {exc}')
+        finally:
+            if writer is not None:
+                try:
+                    writer.release()
+                except Exception:
+                    pass  # Optional backend teardown cannot prevent JSON fallback.
+            if temporary.exists():
+                try:
+                    temporary.unlink()
+                except OSError:
+                    pass  # Startup ignores unreferenced temporary media.
+        saved = replace(incident, media=media)
+        self._atomic_write(_contained(folder, 'incident.json'), (incident_to_json(saved) + '\n').encode())
         return saved
 
     def _run(self):
@@ -374,6 +486,17 @@ class StorageWorker:
             self._atomic_write(probe, b'writable')
             probe.unlink()
             scan = scan_outbox(self.outbox)
+            # A prior process may have exited during optional post-roll. The
+            # snapshot is complete; make the lost clip explicit on restart.
+            recovered = []
+            for incident in scan.incidents:
+                if incident.media.clip_status == 'pending' and incident.incident_id not in self._clip_requests:
+                    incident = replace(incident, media=replace(incident.media,
+                        clip_status='unavailable', clip_error='Post-roll interrupted by application exit'))
+                    self._atomic_write(self.outbox / incident.incident_id / 'incident.json',
+                                       (incident_to_json(incident) + '\n').encode())
+                recovered.append(incident)
+            scan = InboxScan(tuple(recovered), scan.issues)
             self.startup_issues = scan.issues
             with self._lock:
                 self._records.update({i.incident_id: StorageRecord(i, 'saved') for i in scan.incidents})
@@ -406,6 +529,8 @@ class StorageWorker:
                             request = self._requests[key]
                             self._records[key] = StorageRecord(request[0], 'saving')
                         saved = self._save(*request)
+                    elif operation == 'clip':
+                        saved = self._save_clip(key)
                     else:
                         folder = self.outbox / key
                         saved = _read_complete(folder)
@@ -419,6 +544,11 @@ class StorageWorker:
                             self._config_hashes[key] = config_sha256(request[1])
                             if request[2] is not None:
                                 self._media_bytes -= request[2].nbytes
+                                self.media_budget.release(request[2].nbytes)
+                            request = None  # Do not retain the last snapshot on idle.
+                        elif operation == 'clip':
+                            self._clip_requests.pop(key, None)
+                            self._clip_active.discard(key)
                     if deliver:
                         future.set_result(saved)
                 except Exception as exc:
@@ -427,7 +557,10 @@ class StorageWorker:
                         current = self._records[key].incident
                         if operation == 'save':
                             current = replace(current, delivery=Delivery(status='save_failed'))
-                        self._records[key] = StorageRecord(current, 'save_failed' if operation == 'save' else 'ack_failed', message)
+                        self._records[key] = StorageRecord(current, 'save_failed' if operation == 'save' else
+                                                         'clip_failed' if operation == 'clip' else 'ack_failed', message)
+                        if operation == 'clip':
+                            self._clip_active.discard(key)
                     if deliver:
                         future.set_exception(StorageError(message))
                     self._fault(message)

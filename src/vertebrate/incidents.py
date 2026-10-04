@@ -152,14 +152,22 @@ class Media:
     clip_path: str | None = None
     clip_status: str = 'not_requested'
     snapshot_error: str | None = field(default=None, metadata={'omit_none': True})
+    clip_error: str | None = field(default=None, metadata={'omit_none': True})
+    clip_timestamps_path: str | None = field(default=None, metadata={'omit_none': True})
 
     def __post_init__(self):
-        for path in (self.snapshot_path, self.clip_path):
+        for path in (self.snapshot_path, self.clip_path, self.clip_timestamps_path):
             if path is not None:
                 relative_path(path)
-        choice(self.clip_status, ('not_requested', 'saved', 'truncated', 'unavailable'), 'clip_status')
+        choice(self.clip_status, ('not_requested', 'pending', 'saved', 'truncated', 'unavailable'), 'clip_status')
         if (self.clip_status in ('saved', 'truncated')) != (self.clip_path is not None):
             raise ValueError('Clip status and path disagree')
+        if self.clip_timestamps_path is not None and self.clip_path is None:
+            raise ValueError('Clip timestamps require a saved clip')
+        if self.clip_error is not None:
+            text(self.clip_error, 'clip_error')
+            if self.clip_status != 'unavailable':
+                raise ValueError('Clip error requires unavailable status')
         if self.snapshot_path is None:
             text(self.snapshot_error, 'snapshot_error')
         elif self.snapshot_error is not None:
@@ -230,7 +238,8 @@ class Incident:
         observed = self.timing.confirmed_source_s - self.timing.stillness_start_source_s
         if abs(observed - self.kinematics.stillness_observed_s) > 1e-9:
             raise ValueError('Stillness duration disagrees with source-time evidence')
-        paths = [self.configuration.snapshot_path, self.media.snapshot_path, self.media.clip_path]
+        paths = [self.configuration.snapshot_path, self.media.snapshot_path, self.media.clip_path,
+                 self.media.clip_timestamps_path]
         present = [p for p in paths if p is not None]
         if len({p.casefold() for p in present}) != len(present) or any(p.lower() == 'incident.json' for p in present):
             raise ValueError('Incident media/config paths collide')

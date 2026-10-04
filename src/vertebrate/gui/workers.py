@@ -21,6 +21,7 @@ from ..contracts import EndOfStreamEvent, FramePacket, PoseObservation, SessionR
 from ..incidents import IncidentFactory
 from ..pipeline import HeadlessPipeline
 from ..storage import StorageError, StorageWorker
+from ..recorder import ClipRecorder
 
 
 @dataclass(frozen=True)
@@ -292,6 +293,11 @@ Factories are called in their owning workers, permitting hardware-free tests.
         self.owner_ids['vision'] = get_ident()
         attempts = []
         pipe = None
+        recorder = None
+
+        def send_clips(payloads):
+            for payload in payloads:
+                self.storage.attach_clip(payload)
         try:
             from ..pose import PoseAdapter, guarded_runtime
             with guarded_runtime(self.root, attempts):
@@ -310,12 +316,22 @@ Factories are called in their owning workers, permitting hardware-free tests.
                                             pose=PoseAdapter(self.config, self.root, headless=True))
                 pipe.retain_history = False
                 factory = IncidentFactory()
+                if self.config.runtime.enable_optional_clip:
+                    recorder = ClipRecorder(self.storage.media_budget)
                 current = None
 
                 def alert_ready(alert, features):
                     incident = factory.create(alert, features, current, self.config,
                         confirmed_at_utc=datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z'),
                         environment=self.environment, location=self.location)
+                    if recorder is not None:
+                        try:
+                            recorder.request(incident.incident_id, alert.onset_source_t_s,
+                                             alert.confirmed_source_t_s)
+                            incident = replace(incident, media=replace(incident.media, clip_status='pending'))
+                        except MemoryError as exc:
+                            incident = replace(incident, media=replace(incident.media,
+                                clip_status='unavailable', clip_error=str(exc)))
                     self.storage.submit(incident, self.config, current.frame_bgr)
 
                 pipe.on_alert = alert_ready
@@ -337,12 +353,18 @@ Factories are called in their owning workers, permitting hardware-free tests.
                     except Empty:
                         continue
                     if isinstance(current, SessionResetEvent):
+                        if recorder is not None:
+                            send_clips(recorder.flush('Session reset before post-roll completed'))
                         # Fresh per-session state bounds retired identities and
                         # candidate caches; the queue is the stale-frame fence.
                         pipe.source_error()
                         pipe._retired_sessions.clear()
                         factory = IncidentFactory()
                         self.latest.set(None)
+                    if recorder is not None and isinstance(current, FramePacket):
+                        send_clips(recorder.add(current))
+                    elif recorder is not None and isinstance(current, EndOfStreamEvent):
+                        send_clips(recorder.flush())
                     started = time.perf_counter()
                     decisions = pipe.process(current)
                     if isinstance(current, FramePacket):
@@ -361,6 +383,12 @@ Factories are called in their owning workers, permitting hardware-free tests.
                 pipe.source_error()
             self._failure(exc)
         finally:
+            if recorder is not None:
+                try:
+                    send_clips(recorder.flush('Stopped before post-roll completed'))
+                except Exception as exc:
+                    self._failure(exc)
+                recorder = None
             # Drop model/tracker/frame references in their owner, before exit.
             pipe = None
             self.latest.update_status(network_attempts=tuple(attempts))
