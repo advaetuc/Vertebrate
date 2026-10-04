@@ -271,9 +271,17 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps({'status': Status.FAIL, 'error': f'{type(exc).__name__}: {exc}'}))
             return 1
     if args.command == 'evaluate':
-        print(json.dumps({'status': Status.NOT_IMPLEMENTED,
-                          'message': 'Not implemented until ' + ('P1B' if args.command == 'benchmark' else 'P5')}))
-        return 2
+        try:
+            with redirect_stdout(sys.stderr):
+                from .evaluation.metrics import evaluate_manifest
+                report = evaluate_manifest(args.manifest, args.config, args.output)
+            print(json.dumps({'status': report['status'], 'output': args.output,
+                'gates_passed': report['gates_passed'], 'network_attempts': report['network_attempts'],
+                'counts': {k: report['metrics'][k] for k in ('TP', 'FP', 'FN')}}, indent=2, allow_nan=False))
+            return 2 if args.fail_on_gates and not report['gates_passed'] else 0
+        except Exception as exc:
+            print(json.dumps({'status': 'fail', 'error': f'{type(exc).__name__}: {exc}'}))
+            return 1
     try:
         cfg = load_config(args.config)
     except ConfigValidationError as exc:

@@ -109,7 +109,9 @@ class QtWorkerThread:
         self.qt_thread.start()
 
     def is_alive(self):
-        return self.qt_thread is not None and self.qt_thread.isRunning()
+        # isRunning can become false before native thread-local cleanup ends.
+        # A zero-time wait is a nonblocking completion fence before deleteLater.
+        return self.qt_thread is not None and (self.qt_thread.isRunning() or not self.qt_thread.wait(0))
 
     def join(self, timeout=None):
         if self.qt_thread is not None:

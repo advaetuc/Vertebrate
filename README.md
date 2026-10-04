@@ -1,9 +1,9 @@
-# Project VERTEBRATE — P4B
+# Project VERTEBRATE — P5
 
 A single local Python desktop application foundation. P0 implements immutable
 configuration and offline preflight. P1A provides capture and source clocks;
 P1B adds CPU pose, ByteTrack association and a measured offline benchmark.
-P4B adds the desktop workflow and local inbox. Evaluation remains a P5 stub. No cloud services
+P4B adds the desktop workflow and local inbox; P5 adds locked local event scoring. No cloud services
 or paid APIs are used. Synthetic throughput measurements do not establish
 fall-detection accuracy or live-camera performance.
 
@@ -270,3 +270,27 @@ $env:QT_QPA_PLATFORM = 'offscreen'
 Windows offscreen tests register installed Segoe UI/Times New Roman fonts when
 Qt exposes no font families. No font files are bundled. Automated camera tests
 use injected readers; they do not establish physical camera compatibility.
+
+## P5 evaluation
+
+Generate synthetic CFR holdout fixtures with
+`.\.venv\Scripts\python.exe tools/generate_holdout_fixtures.py`, then run
+`.\.venv\Scripts\python.exe -m vertebrate evaluate --manifest data/manifests/holdout.json --config config/demo.json --output reports/evaluation.json`.
+The report records actual inference, counts, exact Clopper-Pearson intervals,
+one-sided Poisson bounds, observed pose coverage and processing timings.
+Config, model, source code and manifest hashes plus matching policy are frozen
+in `reports/evaluation.lock.json` before inference. Dev/holdout group overlap is
+rejected. The matching policy is fixed before scoring; no thresholds are tuned.
+
+Person association requires a unique annotated frame-zero box match. Numeric
+tracker IDs are never assumed to be annotation labels; missing or ambiguous
+associations remain unresolved (alerts are FP and missed eligible events FN).
+Annotations describe the synthetic drawings, independently of detector outputs.
+Fixture `supported` marks the core scoring path, not proof of human applicability.
+`--fail-on-gates` returns exit 2 when chosen numeric gates fail (including missing
+evidence); normal evaluation returns 0 on a completed run even when gates fail.
+Runtime/input failures return 1. Excluded/ambiguity cases are reported separately.
+
+Synthetic fixtures and repeated regression runs cannot establish unseen human
+accuracy. Human calibration, direction quotas, actual-room negative exposure,
+identity review and the remaining hardware/rehearsal/soak gates remain unverified.

@@ -59,6 +59,7 @@ class HeadlessPipeline:
         self.on_alert = on_alert
         self.retain_history = retain_history
         self.last_observation = None
+        self.last_samples = ()
 
     def _record(self, fsm, decision, previous):
         if not self.retain_history:
@@ -141,6 +142,7 @@ class HeadlessPipeline:
         """Process already-associated immutable tracks; absent people get no credit."""
         self._check_frame(self.session_id, sequence, source_t_s)
         samples = tuple(samples)
+        self.last_samples = samples
         keys = [s.person_key for s in samples]
         if len(set(keys)) != len(keys) or len({k.tracker_id for k in keys}) != len(keys):
             raise ValueError('Duplicate person/numeric tracker ID in one frame')
