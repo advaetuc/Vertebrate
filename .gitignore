@@ -1,12 +1,34 @@
+# Python
 .venv/
+venv/
 __pycache__/
-*.pyc
-.pytest_cache/
-runtime/outbox/
-runtime/logs/
-runtime/wheelhouse/
-data/videos/
+*.py[cod]
 *.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage*
+htmlcov/
 build/
 dist/
-runtime/setup-wheels/
+
+# Local data, weights, output and backups
+data/videos/
+*.pt
+*.onnx
+*.engine
+runtime/
+runs/
+reports/
+.archive/
+*.log
+
+# Secrets, editors and OS files
+.env
+.env.*
+!.env.example
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+Desktop.ini
