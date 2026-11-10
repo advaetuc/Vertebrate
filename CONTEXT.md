@@ -120,6 +120,8 @@ log CSV (see "Fall log" below).
 | Ultralytics settings/cache | `runtime/logs/standalone-yolo/` | Local and ignored by Git |
 | URFD footage | `data/videos/urfd/` | Local clips and ignored by Git |
 | Fall log | `runtime/logs/falls/<device>.csv` | One row per finished fall event; ignored by Git |
+| Alarm delay | `QSettings` ("Vertebrate") | Seconds before the alarm rings; 0 = off |
+| Alarm sound | `runtime/sounds/alarm.wav` | Generated siren; ignored by Git |
 
 ### Fall log
 
@@ -131,13 +133,33 @@ went off, so short flickers do not split one fall. Stopping the camera, a worker
 error, or closing the app ends an ongoing event with that reason. Each finished
 event appends one CSV row: `device, fall_detected_at, ended_at, utc_offset,
 duration, duration_seconds, latitude, longitude, accuracy_m, location_source,
-ended_by`. Location is the `LocationFeed` fix at the start (or the first fix
+ended_by, alarm_after_seconds, alarm_rang_at, alarm_silenced_at`. Logs written
+by an older version are rewritten once with the new columns (rows kept,
+new cells empty). Location is the `LocationFeed` fix at the start (or the first fix
 during the event). The device name is the host name (`QSysInfo`), and each
 device writes its own file. The file is UTF-8 with BOM so Excel shows symbols.
 The **Fall log** button opens a non-modal `FallLogDialog` listing this device's
 events newest first, with an ongoing fall shown live on top, totals, and a
 button that opens the log folder. Write/read failures are shown in that window
 and printed to stderr; they never stop monitoring.
+
+### Emergency alarm
+
+The **Alarm if fallen for** spin box (0–600 s, 0 = Off, default 30 s) is saved
+with `QSettings` per user and device. `MainWindow.check_alarm()` runs every
+250 ms while the camera is on and on each displayed frame: when the ongoing
+`FallLog` event has lasted the chosen delay (counted from the fall alert, so
+after the five-frame debounce), `AlarmSound` loops a two-tone siren on this
+device's speakers, the window comes to the front, the banner shows
+"EMERGENCY ALARM · fallen for …", and a **Silence alarm** button appears.
+Before that, the banner counts down "alarm in N s". The alarm rings at most
+once per fall and stops when the fall event ends (posture cleared for 2 s),
+when Silence is pressed, when the delay is set to Off, or when the camera stops.
+Ring and silence times are written to the fall log. The siren WAV is generated
+with NumPy into `runtime/sounds/alarm.wav` on first use (Git-ignored); without
+Qt Multimedia, repeated system beeps are used. App volume is 100%, but the
+device's system volume and mute still apply. The alarm is local only; there is
+still no external dispatch.
 
 `models/manifest.json` records model name/path, SHA-256, size, source, version,
 task, and license. At startup, `app.py` checks only that the selected file

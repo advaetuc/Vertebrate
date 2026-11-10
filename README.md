@@ -109,6 +109,17 @@ history; a fall happening now appears live at the top. Each computer keeps its
 own file, `runtime/logs/falls/<device-name>.csv`, which opens in Excel or
 Numbers. No images or video are saved.
 
+### Emergency alarm
+
+Set **Alarm if fallen for** (bottom bar) to the number of seconds a person may
+stay fallen before a loud siren rings on this device; choose **Off** (0) to
+disable it. The setting is remembered. While a fall is detected the banner
+counts down; when the alarm rings, the window comes to the front and a
+**Silence alarm** button appears. The alarm stops on its own when the person
+gets up, and ring/silence times are added to the fall log. Keep the device's
+volume up: the app cannot override a muted speaker. The alarm sounds only on
+this device; nobody is contacted.
+
 ## Workspace after cleanup
 
 ```text
