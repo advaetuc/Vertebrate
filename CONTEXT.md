@@ -106,7 +106,8 @@ specified.
 ### Data architecture and state
 
 There is no application database or user record schema. The app does not save
-incident JSON, snapshots, or webcam clips.
+snapshots or webcam clips. The only persistent record is the per-device fall
+log CSV (see "Fall log" below).
 
 | Data | Lifetime/location | Notes |
 |---|---|---|
@@ -118,6 +119,25 @@ incident JSON, snapshots, or webcam clips.
 | Model weights | Local filesystem | Root checked first, then `models/` |
 | Ultralytics settings/cache | `runtime/logs/standalone-yolo/` | Local and ignored by Git |
 | URFD footage | `data/videos/urfd/` | Local clips and ignored by Git |
+| Fall log | `runtime/logs/falls/<device>.csv` | One row per finished fall event; ignored by Git |
+
+### Fall log
+
+`FallLog` (GUI thread, fed from `MainWindow.show_frame()`) turns the debounced
+alert into events. An event **starts** when the alert turns on (i.e. after the
+five-frame debounce, so slightly after the posture began) and **ends** when the
+alert has stayed off for `END_GRACE_S` = 2 s; the end time is when it first
+went off, so short flickers do not split one fall. Stopping the camera, a worker
+error, or closing the app ends an ongoing event with that reason. Each finished
+event appends one CSV row: `device, fall_detected_at, ended_at, utc_offset,
+duration, duration_seconds, latitude, longitude, accuracy_m, location_source,
+ended_by`. Location is the `LocationFeed` fix at the start (or the first fix
+during the event). The device name is the host name (`QSysInfo`), and each
+device writes its own file. The file is UTF-8 with BOM so Excel shows symbols.
+The **Fall log** button opens a non-modal `FallLogDialog` listing this device's
+events newest first, with an ongoing fall shown live on top, totals, and a
+button that opens the log folder. Write/read failures are shown in that window
+and printed to stderr; they never stop monitoring.
 
 `models/manifest.json` records model name/path, SHA-256, size, source, version,
 task, and license. At startup, `app.py` checks only that the selected file
@@ -152,6 +172,37 @@ Before importing Ultralytics, `app.py` sets `YOLO_OFFLINE=true`,
 Weights must be present locally. There is no upload, remote inference, or
 dispatch code. Webcam frames stay in process memory. Package installation or a
 manual weights download is separate setup and may require a network connection.
+
+### Location watermark
+
+`LocationFeed` (GUI thread) runs up to two Qt Positioning sources:
+
+1. **GPS receiver** (`"nmea"` plugin), only when `find_gps_port()` finds a
+   serial/USB/Bluetooth port whose vendor ID (u-blox, Garmin) or description
+   looks like GPS/GNSS. `VERTEBRATE_GPS_PORT` overrides detection (`COM4`,
+   `/dev/cu.usbmodem1101`, or `off`); `VERTEBRATE_GPS_BAUD` defaults to 9600.
+2. **System location** (`"winrt"` on Windows, `"corelocation"` on macOS) with
+   all positioning methods allowed, so the OS uses a built-in GPS chip when the
+   device has one and Wi-Fi/network positioning otherwise.
+
+A GPS-receiver fix received within 10 s wins; otherwise the system fix is
+shown. Sources start with **Start camera** (the system source after a one-time
+`QLocationPermission` request) and stop when the worker finishes.
+`paint_watermark()` draws latitude/longitude, horizontal accuracy, local
+date/time and the source in the bottom-left of each displayed frame inside
+`MainWindow.show_frame()`; the worker thread is not involved. Only the latest
+fix per source is held in memory; it is never saved or sent by the app. OS
+Wi-Fi positioning may contact the OS vendor's location service. If access is
+denied, the watermark shows the reason. Fixes older than 60 s show their age.
+
+### Platform support
+
+Windows 10/11 x64 and macOS, Python 3.12, CPU inference. `open_camera()` tries
+DirectShow then Media Foundation on Windows and AVFoundation on macOS; camera
+help text names each OS's privacy setting. The UI uses the platform system
+font (`QFontDatabase.systemFont`) and scales the video in physical pixels for
+Retina/high-DPI displays. Install with `requirements.txt` on Windows and
+`requirements_macOS.txt` on macOS.
 
 ---
 
@@ -279,8 +330,8 @@ per worker session. Emit readable errors and release owned resources in
 
 The worker catches runtime exceptions and emits type/message. The GUI displays
 the error and restores controls on thread completion. Camera open/read failures
-have specific guidance. There is no global exception framework, structured
-incident log, or rotating app log. Ultralytics settings/cache are under
+have specific guidance. There is no global exception framework or rotating
+app log; fall events go to the per-device fall log CSV. Ultralytics settings/cache are under
 `runtime/logs/standalone-yolo/`.
 
 Do not suppress failures that could leave the camera open or UI stuck. New
@@ -402,8 +453,10 @@ safety/accuracy claim.
 - Fixed 20-pixel margin changes meaning with image scale and subject distance.
 - Scene-wide debounce can combine detections from different people.
 - Spine geometry has no explicit keypoint-confidence cutoff.
-- No tracking, video input, camera selector, recording, incident storage,
-  benchmark CLI, or release evaluation is active.
+- No tracking, video input, camera selector, recording, benchmark CLI, or
+  release evaluation is active. The fall log records alert times, not footage.
+- A fall in progress when the app crashes is not logged (rows are written when
+  an event ends).
 - Root weights are preferred; manifest hash is not enforced at startup.
 - Historical URFD reports belong to archived code and do not establish this
   app's performance.

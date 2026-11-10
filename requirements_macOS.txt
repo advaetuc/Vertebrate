@@ -1,0 +1,7 @@
+# macOS / Python 3.12 / CPU. Pinned direct dependencies.
+torch
+torchvision
+ultralytics==8.3.203
+numpy==2.2.6
+opencv-python==4.12.0.88
+PySide6==6.9.2
