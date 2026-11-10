@@ -63,7 +63,8 @@ no external emergency dispatch.”**
 A local desktop monolith with an event-driven Qt thread boundary. One `QThread`
 owns the OpenCV camera, YOLO model, inference, geometry, annotation, and
 debounce. The Qt main thread owns `QMainWindow` and all widgets. The worker emits
-a detached `QImage` and boolean alert state by Qt signal; queued delivery runs
+a detached `QImage`, the boolean alert state, the debounce count and the
+number of people detected by Qt signal; queued delivery runs
 the receiving slot on the main thread. There is no database, authentication,
 microservice, or cloud-processing tier.
 
@@ -73,7 +74,7 @@ microservice, or cloud-processing tier.
 | Annotation | `annotate()` | Current mutable frame only |
 | Debounce | `Debounce` | Positive-frame count, worker-owned |
 | Camera/inference | `CameraThread.run()` | Capture, model, debounce, pending-frame event |
-| Desktop UI | `MainWindow` | Widgets, pixmap, flash timer, worker lifecycle |
+| Desktop UI | `MainWindow`, `VideoView`, `EvidenceMeter`, `StatTile` | UI state, timers, worker lifecycle |
 
 The model and camera are constructed in `CameraThread.run()`. The camera is
 released in that worker's `finally` block. Stop uses `requestInterruption()`
@@ -143,9 +144,32 @@ events newest first, with an ongoing fall shown live on top, totals, and a
 button that opens the log folder. Write/read failures are shown in that window
 and printed to stderr; they never stop monitoring.
 
+### User interface
+
+Fusion style with a dark palette (`apply_dark_theme()`) so Windows and macOS
+look the same; Qt 6.8+ also gets dark native title bars. Colours are defined
+once as constants above `STYLESHEET`: one teal-to-sky accent for actions, and
+green / orange / red reserved for clear / fall / alarm. Typography uses the
+platform UI font, with the fixed-width system font for numbers.
+
+- **Header:** logo mark, product name, device chip, live clock, state pill.
+- **Main column:** an escalating banner (orange "Fall detected" with countdown;
+  pulsing red "EMERGENCY ALARM" with a white **Silence alarm** button), the
+  live view (`VideoView`: rounded, state-coloured border, LIVE tag,
+  placeholder with a camera glyph when off), and Start monitoring / Stop /
+  Fall log buttons.
+- **Sidebar (scrolls on small windows):** Status card (tinted by state), Fall
+  evidence meter (the five-frame debounce, sent by the worker and no longer
+  drawn on the frame), Live stats (people in view, frames per second, falls
+  today, alarm countdown), Location, and the Emergency alarm setting.
+
+`MainWindow.set_state()` drives everything from one state: idle, starting,
+monitoring, fall, alarm, stopping, error. Stylesheets change only when the
+state (or the alarm pulse) changes; per-frame updates touch text only.
+
 ### Emergency alarm
 
-The **Alarm if fallen for** spin box (0–600 s, 0 = Off, default 30 s) is saved
+The **Ring if fallen for** stepper (sidebar "Emergency alarm" card) (0–600 s, 0 = Off, default 30 s) is saved
 with `QSettings` per user and device. `MainWindow.check_alarm()` runs every
 250 ms while the camera is on and on each displayed frame: when the ongoing
 `FallLog` event has lasted the chosen delay (counted from the fall alert, so
@@ -168,7 +192,7 @@ Never claim launch-time integrity checking.
 
 ### Critical runtime flow
 
-1. The user clicks **Start camera**.
+1. The user clicks **Start monitoring**.
 2. The GUI creates/starts `CameraThread`, disables Start, enables Stop.
 3. The worker calls `local_weights()`. Missing weights produce a local error
    before `YOLO` is constructed; no download fallback is intended.
@@ -208,7 +232,7 @@ manual weights download is separate setup and may require a network connection.
    device has one and Wi-Fi/network positioning otherwise.
 
 A GPS-receiver fix received within 10 s wins; otherwise the system fix is
-shown. Sources start with **Start camera** (the system source after a one-time
+shown. Sources start with **Start monitoring** (the system source after a one-time
 `QLocationPermission` request) and stop when the worker finishes.
 `paint_watermark()` draws latitude/longitude, horizontal accuracy, local
 date/time and the source in the bottom-left of each displayed frame inside
@@ -333,13 +357,13 @@ Signal pattern:
 
 ~~~python
 class CameraThread(QThread):
-    frame_ready = Signal(QImage, bool)
+    frame_ready = Signal(QImage, bool, int, int)  # frame, alert, evidence, people
     error = Signal(str)
 
     # After inference and BGR -> RGB conversion:
     image = QImage(rgb.data, width, height, rgb.strides[0],
                    QImage.Format.Format_RGB888).copy()
-    self.frame_ready.emit(image, is_fallen)
+    self.frame_ready.emit(image, is_fallen, debounce.count, people)
 
 worker.frame_ready.connect(window.show_frame, Qt.ConnectionType.QueuedConnection)
 ~~~
