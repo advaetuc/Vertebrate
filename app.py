@@ -20,6 +20,7 @@ import platform
 import re
 import sys
 import threading
+import wave
 
 # Set before importing Ultralytics. The installed version expects "true".
 os.environ["YOLO_OFFLINE"] = "true"
@@ -30,8 +31,8 @@ os.environ["YOLO_CONFIG_DIR"] = str(Path(__file__).resolve().parent / "runtime" 
 import cv2
 import numpy as np
 from PySide6.QtCore import (
-    QCoreApplication, QDateTime, QLocationPermission, QObject, QRectF, QSysInfo, Qt, QThread,
-    QTimer, QUrl, Signal, Slot,
+    QCoreApplication, QDateTime, QLocationPermission, QObject, QRectF, QSettings, QSysInfo, Qt,
+    QThread, QTimer, QUrl, Signal, Slot,
 )
 from PySide6.QtGui import (
     QCloseEvent, QColor, QDesktopServices, QFont, QFontDatabase, QImage, QPainter, QPixmap,
@@ -39,8 +40,12 @@ from PySide6.QtGui import (
 from PySide6.QtPositioning import QGeoPositionInfo, QGeoPositionInfoSource
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QDialog, QHBoxLayout, QHeaderView, QLabel, QMainWindow,
-    QPushButton, QSizePolicy, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
+    QPushButton, QSizePolicy, QSpinBox, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
 )
+try:  # Qt Multimedia plays the alarm; without it the app falls back to system beeps.
+    from PySide6.QtMultimedia import QSoundEffect
+except ImportError:
+    QSoundEffect = None
 
 IS_WINDOWS = sys.platform == "win32"
 IS_MACOS = sys.platform == "darwin"
@@ -74,7 +79,15 @@ END_GRACE_S = 2.0
 LOG_FIELDS = (
     "device", "fall_detected_at", "ended_at", "utc_offset", "duration", "duration_seconds",
     "latitude", "longitude", "accuracy_m", "location_source", "ended_by",
+    "alarm_after_seconds", "alarm_rang_at", "alarm_silenced_at",
 )
+
+# Emergency alarm -----------------------------------------------------------
+# Rings on this device when a fall lasts longer than the user's chosen delay,
+# counted from when the fall alert started. 0 = alarm off.
+ALARM_DEFAULT_S = 30
+ALARM_MAX_S = 600
+ALARM_SOUND = Path(__file__).resolve().parent / "runtime" / "sounds" / "alarm.wav"  # generated
 
 if IS_WINDOWS:
     CAMERA_BACKENDS =(cv2.CAP_DSHOW, cv2.CAP_MSMF)  # DirectShow opens faster; MSMF as fallback.
@@ -450,7 +463,8 @@ class FallLog:
         if is_fallen:
             self._clear_since = None
             if self.current is None:
-                self.current = {"start": now, "location": location}
+                self.current = {"start": now, "location": location,
+                                "alarm_after": None, "alarm_rang": None, "alarm_silenced": None}
                 return True
             if self.current["location"] is None and location is not None:
                 self.current["location"] = location  # first fix arrived mid-event
@@ -471,14 +485,25 @@ class FallLog:
         self._finish(self._clear_since or datetime.now().astimezone(), reason)
         return True
 
+    def mark_alarm(self, after_seconds: int) -> None:
+        if self.current is not None and self.current["alarm_rang"] is None:
+            self.current["alarm_after"] = after_seconds
+            self.current["alarm_rang"] = datetime.now().astimezone()
+
+    def mark_silenced(self) -> None:
+        if self.current is not None and self.current["alarm_rang"] is not None:
+            self.current["alarm_silenced"] = datetime.now().astimezone()
+
     def ongoing_seconds(self) -> float:
         if self.current is None:
             return 0.0
         return (datetime.now().astimezone() - self.current["start"]).total_seconds()
 
     def _finish(self, end: datetime, reason: str) -> None:
-        start, location = self.current["start"], self.current["location"]
+        event = self.current
+        start, location = event["start"], event["location"]
         self.current, self._clear_since = None, None
+        stamp = lambda moment: moment.strftime("%Y-%m-%d %H:%M:%S") if moment else ""
         seconds = (end - start).total_seconds()
         offset = start.strftime("%z")
         lat, lon, accuracy, source = location if location is not None else ("", "", None, "unavailable")
@@ -494,9 +519,13 @@ class FallLog:
             "accuracy_m": f"{accuracy:.0f}" if accuracy else "",
             "location_source": source,
             "ended_by": reason,
+            "alarm_after_seconds": event["alarm_after"] if event["alarm_after"] is not None else "",
+            "alarm_rang_at": stamp(event["alarm_rang"]),
+            "alarm_silenced_at": stamp(event["alarm_silenced"]),
         }
         try:
             FALL_LOG_DIR.mkdir(parents=True, exist_ok=True)
+            self._upgrade_header()
             new_file = not self.path.exists() or self.path.stat().st_size == 0
             # utf-8-sig so Excel shows the ° and ± correctly; newline="" per csv docs.
             with self.path.open("a", newline="", encoding="utf-8-sig" if new_file else "utf-8") as handle:
@@ -508,6 +537,20 @@ class FallLog:
         except OSError as exc:
             self.last_error = f"Could not write the fall log: {exc}"
             print(self.last_error, file=sys.stderr)
+
+    def _upgrade_header(self) -> None:
+        """Rewrite a log made by an older version so its columns match LOG_FIELDS."""
+        if not self.path.exists() or self.path.stat().st_size == 0:
+            return
+        with self.path.open(newline="", encoding="utf-8-sig") as handle:
+            reader = csv.DictReader(handle)
+            if tuple(reader.fieldnames or ()) == LOG_FIELDS:
+                return
+            old_rows = list(reader)
+        with self.path.open("w", newline="", encoding="utf-8-sig") as handle:
+            writer = csv.DictWriter(handle, fieldnames=LOG_FIELDS, restval="", extrasaction="ignore")
+            writer.writeheader()
+            writer.writerows(old_rows)
 
     def rows(self) -> list[dict]:
         """Finished events for this device, newest first."""
@@ -524,7 +567,8 @@ class FallLog:
 
 class FallLogDialog(QDialog):
     """Window listing this device's fall events; an ongoing fall is shown live on top."""
-    COLUMNS = ("Fall detected at", "Ended at", "Duration", "Location", "Location source", "Ended by")
+    COLUMNS = ("Fall detected at", "Ended at", "Duration", "Alarm", "Location", "Location source", "Ended by")
+    LOCATION_COLUMN = 4
 
     def __init__(self, log: FallLog, parent=None):
         super().__init__(parent)
@@ -549,7 +593,7 @@ class FallLogDialog(QDialog):
         self.table.setAlternatingRowColors(True)
         header = self.table.horizontalHeader()
         header.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(self.LOCATION_COLUMN, QHeaderView.ResizeMode.Stretch)
         layout.addWidget(self.table, 1)
         self.empty = QLabel("No falls recorded on this device yet.")
         self.empty.setObjectName("subtitle")
@@ -588,13 +632,16 @@ class FallLogDialog(QDialog):
         rows = self.log.rows()
         entries = []
         if self.log.current is not None:
-            start = self.log.current["start"]
+            current = self.log.current
+            stamp = lambda moment: moment.strftime("%Y-%m-%d %H:%M:%S") if moment else ""
             entries.append(({
-                "fall_detected_at": start.strftime("%Y-%m-%d %H:%M:%S"),
+                "fall_detected_at": stamp(current["start"]),
                 "ended_at": "ongoing",
                 "duration": format_duration(self.log.ongoing_seconds()),
-                **self._location_fields(self.log.current["location"]),
+                **self._location_fields(current["location"]),
                 "ended_by": "—",
+                "alarm_rang_at": stamp(current["alarm_rang"]),
+                "alarm_silenced_at": stamp(current["alarm_silenced"]),
             }, True))
         entries += [(row, False) for row in rows]
         self.table.setRowCount(len(entries))
@@ -605,8 +652,13 @@ class FallLogDialog(QDialog):
                 location = f"{float(row['latitude']):.5f}, {float(row['longitude']):.5f}"
                 if row.get("accuracy_m"):
                     location += f"  (±{row['accuracy_m']} m)"
+            alarm = "—"
+            if row.get("alarm_rang_at"):
+                alarm = f"Rang {row['alarm_rang_at'][-8:]}"  # time part; date is in the first column
+                if row.get("alarm_silenced_at"):
+                    alarm += f", silenced {row['alarm_silenced_at'][-8:]}"
             values = (row.get("fall_detected_at", ""), row.get("ended_at", ""), row.get("duration", ""),
-                      location, row.get("location_source", ""), row.get("ended_by", ""))
+                      alarm, location, row.get("location_source", ""), row.get("ended_by", ""))
             for c, value in enumerate(values):
                 item = QTableWidgetItem(value)
                 if ongoing:
@@ -615,9 +667,10 @@ class FallLogDialog(QDialog):
         self.table.setVisible(bool(entries))
         self.empty.setVisible(not entries)
         total = sum(float(row.get("duration_seconds") or 0) for row in rows)
+        alarms = sum(1 for row in rows if row.get("alarm_rang_at"))
         text = f"{len(rows)} recorded fall{'s' if len(rows) != 1 else ''}"
         if rows:
-            text += f" · total time in alert {format_duration(total)}"
+            text += f" · alarm rang {alarms}× · total time in alert {format_duration(total)}"
         if self.log.current is not None:
             text += " · a fall is being detected now"
         text += f"\nFile: {self.log.path}"
@@ -639,6 +692,63 @@ class FallLogDialog(QDialog):
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(FALL_LOG_DIR)))
 
 
+def ensure_alarm_sound(path: Path = ALARM_SOUND) -> Path:
+    """Write a loud two-tone siren (one 1 s loop) as a WAV file if it is missing."""
+    if path.is_file() and path.stat().st_size > 0:
+        return path
+    rate, half = 44100, 22050
+    t = np.arange(half) / rate
+    ramp = np.minimum(1.0, np.minimum(t, t[::-1]) / 0.01)  # 10 ms fades: no clicks at joins
+    tones = [np.tanh(3 * np.sin(2 * np.pi * freq * t)) * ramp for freq in (960, 720)]  # bright, square-ish
+    samples = (np.concatenate(tones) * 0.9 * 32767).astype("<i2")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with wave.open(str(path), "wb") as handle:
+        handle.setnchannels(1)
+        handle.setsampwidth(2)
+        handle.setframerate(rate)
+        handle.writeframes(samples.tobytes())
+    return path
+
+
+class AlarmSound(QObject):
+    """Loops the siren on this device's speakers until stopped. GUI thread only.
+    Falls back to repeated system beeps if Qt Multimedia or the WAV is unavailable."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.ringing = False
+        self._effect = None
+        self._beeper = QTimer(self)
+        self._beeper.setInterval(600)
+        self._beeper.timeout.connect(QApplication.beep)
+        if QSoundEffect is None:
+            return
+        try:
+            self._effect = QSoundEffect(self)
+            self._effect.setSource(QUrl.fromLocalFile(str(ensure_alarm_sound())))
+            self._effect.setLoopCount(QSoundEffect.Loop.Infinite.value)
+            self._effect.setVolume(1.0)  # App volume; the device's system volume still applies.
+        except Exception as exc:
+            print(f"Alarm sound unavailable, using system beeps: {exc}", file=sys.stderr)
+            self._effect = None
+
+    def start(self) -> None:
+        if self.ringing:
+            return
+        self.ringing = True
+        if self._effect is not None and self._effect.status() != QSoundEffect.Status.Error:
+            self._effect.play()
+        else:
+            QApplication.beep()
+            self._beeper.start()
+
+    def stop(self) -> None:
+        self.ringing = False
+        self._beeper.stop()
+        if self._effect is not None:
+            self._effect.stop()
+
+
 #Front end GUI BELOW.
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -653,6 +763,8 @@ class MainWindow(QMainWindow):
         self.location = LocationFeed(self)
         self.fall_log = FallLog(device_name())
         self.log_dialog = None
+        self.alarm = AlarmSound(self)
+        self.settings = QSettings("Vertebrate", "Vertebrate")  # per-user, per-device preferences
         self.setWindowTitle("Live Pose · Fall Detection")
         self.resize(1120, 800)
         self.setMinimumSize(640, 480)
@@ -684,9 +796,30 @@ class MainWindow(QMainWindow):
         self.log_button = QPushButton()
         self.log_button.setObjectName("logButton")
         self.log_button.setToolTip(f"Falls recorded on {self.fall_log.device}")
+        self.silence_button = QPushButton("🔕  Silence alarm")
+        self.silence_button.setObjectName("silenceButton")
+        self.silence_button.setVisible(False)
+        alarm_label = QLabel("Alarm if fallen for")
+        alarm_label.setObjectName("subtitle")
+        self.alarm_delay = QSpinBox()
+        self.alarm_delay.setRange(0, ALARM_MAX_S)
+        self.alarm_delay.setSingleStep(5)
+        self.alarm_delay.setSuffix(" s")
+        self.alarm_delay.setSpecialValueText("Off")  # shown at 0
+        self.alarm_delay.setToolTip("Ring an alarm on this device when a detected fall lasts this long. "
+                                    "0 turns the alarm off.")
+        try:
+            saved = int(self.settings.value("alarm_after_s", ALARM_DEFAULT_S))
+        except (TypeError, ValueError):
+            saved = ALARM_DEFAULT_S
+        self.alarm_delay.setValue(min(max(saved, 0), ALARM_MAX_S))
         controls.addWidget(self.start_button)
         controls.addWidget(self.stop_button)
+        controls.addWidget(self.silence_button)
         controls.addStretch()
+        controls.addWidget(alarm_label)
+        controls.addWidget(self.alarm_delay)
+        controls.addSpacing(12)
         controls.addWidget(self.log_button)
         layout.addLayout(controls)
         footer = QLabel("Local demo — no external emergency dispatch")
@@ -704,6 +837,10 @@ class MainWindow(QMainWindow):
             QPushButton:disabled { background: #222832; color: #737e8d; border-color: #303846; }
             QPushButton#logButton { background: #2a3140; }
             QPushButton#logButton:hover { background: #374155; }
+            QPushButton#silenceButton { background: #b52e3c; border-color: #e0525f; font-weight: 700; }
+            QPushButton#silenceButton:hover { background: #cc3a49; }
+            QSpinBox { background: #0f131a; border: 1px solid #50647d; border-radius: 7px;
+                       padding: 8px 10px; min-width: 84px; }
             QLabel#dialogTitle { font-size: 22px; font-weight: 600; }
             QTableWidget { background: #0f131a; alternate-background-color: #151b24;
                            gridline-color: #262e3b; border: 1px solid #303846; border-radius: 8px; }
@@ -715,7 +852,13 @@ class MainWindow(QMainWindow):
         self.start_button.clicked.connect(self.start_camera)
         self.stop_button.clicked.connect(self.stop_camera)
         self.log_button.clicked.connect(self.open_log)
+        self.silence_button.clicked.connect(self.silence_alarm)
+        self.alarm_delay.valueChanged.connect(self.alarm_delay_changed)
         self.update_log_button()
+        # Checks the ongoing fall against the alarm delay independently of frame rate.
+        self.alarm_timer = QTimer(self)
+        self.alarm_timer.setInterval(250)
+        self.alarm_timer.timeout.connect(self.check_alarm)
         self.flash_timer = QTimer(self)
         self.flash_timer.setInterval(450)
         self.flash_timer.timeout.connect(self.flash_alert)
@@ -743,6 +886,7 @@ class MainWindow(QMainWindow):
         self.worker.error.connect(self.show_error, Qt.ConnectionType.QueuedConnection)
         self.worker.finished.connect(self.camera_finished, Qt.ConnectionType.QueuedConnection)
         self.location.start()
+        self.alarm_timer.start()
         self.worker.start()
 
     @Slot()
@@ -751,6 +895,7 @@ class MainWindow(QMainWindow):
             return
         self._stopping = True
         self.flash_timer.stop()
+        self.stop_alarm()  # Someone is at the device; stopping the camera also stops the alarm.
         self._alert = False
         self.stop_button.setEnabled(False)
         self.worker.requestInterruption()
@@ -766,7 +911,10 @@ class MainWindow(QMainWindow):
             paint_watermark(image, self.location.watermark_lines())  # image is our detached copy
             self._pixmap = QPixmap.fromImage(image)
             self.fit_video()
-            if is_fallen:
+            if self.fall_log.update(is_fallen, self.location.current_fix()):
+                self.log_changed()
+            # Keep flashing while the alarm rings, even if one frame misses the person.
+            if is_fallen or self.alarm.ringing:
                 if not self._alert:
                     self._alert = True
                     self._flash_on = False
@@ -776,8 +924,7 @@ class MainWindow(QMainWindow):
                 self._alert = False
                 self.flash_timer.stop()
                 self.set_status("Monitoring · no confirmed fall", "#1e4336")
-            if self.fall_log.update(is_fallen, self.location.current_fix()):
-                self.log_changed()
+            self.check_alarm()
         finally:
             if worker is not None:
                 worker.frame_consumed()
@@ -785,7 +932,56 @@ class MainWindow(QMainWindow):
     @Slot()
     def flash_alert(self):
         self._flash_on = not self._flash_on
-        self.set_status("🚨 FALL DETECTED 🚨", "#b52e3c" if self._flash_on else "#631e2a")
+        delay = self.alarm_delay.value()
+        current = self.fall_log.current
+        fallen_for = self.fall_log.ongoing_seconds()
+        if self.alarm.ringing:
+            text = f"🚨 EMERGENCY ALARM · fallen for {format_duration(fallen_for)} 🚨"
+            colors = ("#e0262f", "#7a0f17")
+        elif current is not None and delay > 0 and current["alarm_rang"] is None:
+            text = f"🚨 FALL DETECTED · alarm in {max(0, int(delay - fallen_for + 0.999))} s 🚨"
+            colors = ("#b52e3c", "#631e2a")
+        else:
+            text = "🚨 FALL DETECTED 🚨"
+            colors = ("#b52e3c", "#631e2a")
+        self.set_status(text, colors[0] if self._flash_on else colors[1])
+
+    @Slot()
+    def check_alarm(self):
+        """Ring once per fall when it has lasted the chosen delay; stop when it ends."""
+        current = self.fall_log.current
+        if current is None:
+            if self.alarm.ringing:
+                self.stop_alarm()  # The fall ended (posture cleared or camera stopped).
+            return
+        delay = self.alarm_delay.value()
+        if (delay > 0 and not self.alarm.ringing and current["alarm_rang"] is None
+                and self.fall_log.ongoing_seconds() >= delay):
+            self.fall_log.mark_alarm(delay)
+            self.alarm.start()
+            self.silence_button.setVisible(True)
+            self.silence_button.setFocus()  # Space/Enter silences it
+            self.raise_()
+            self.activateWindow()
+            self.flash_alert()
+            self.log_changed()
+
+    @Slot()
+    def silence_alarm(self):
+        if self.alarm.ringing:
+            self.fall_log.mark_silenced()
+            self.log_changed()
+        self.stop_alarm()
+
+    def stop_alarm(self):
+        self.alarm.stop()
+        self.silence_button.setVisible(False)
+
+    @Slot(int)
+    def alarm_delay_changed(self, value):
+        self.settings.setValue("alarm_after_s", value)
+        if value == 0 and self.alarm.ringing:
+            self.silence_alarm()  # Turning the alarm off while it rings silences it.
 
     @Slot(str)
     def show_error(self, message):
@@ -797,6 +993,8 @@ class MainWindow(QMainWindow):
     def camera_finished(self):
         self.stop_timer.stop()
         self.flash_timer.stop()
+        self.alarm_timer.stop()
+        self.stop_alarm()
         # A fall still in progress ends here; record why.
         reason = f"Error: {self._error}" if self._error else ("App closed" if self._closing else "Camera stopped")
         if self.fall_log.close_event(reason):
