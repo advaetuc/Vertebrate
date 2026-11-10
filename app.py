@@ -11,7 +11,10 @@ when one is found, otherwise the operating system's location service (its own
 GPS chip if the device has one, else Wi-Fi/network positioning).
 Confirmed fall alerts are logged per device to runtime/logs/falls/<device>.csv
 (times, duration, location; never images) and listed by the Fall log button.
+If a fall lasts longer than the user-set delay, a siren rings on this device
+until the person gets up or someone presses Silence.
 """
+from collections import deque
 from datetime import datetime
 from pathlib import Path
 import csv
@@ -20,6 +23,7 @@ import platform
 import re
 import sys
 import threading
+import time
 import wave
 
 # Set before importing Ultralytics. The installed version expects "true".
@@ -35,12 +39,14 @@ from PySide6.QtCore import (
     QThread, QTimer, QUrl, Signal, Slot,
 )
 from PySide6.QtGui import (
-    QCloseEvent, QColor, QDesktopServices, QFont, QFontDatabase, QImage, QPainter, QPixmap,
+    QCloseEvent, QColor, QDesktopServices, QFont, QFontDatabase, QImage, QLinearGradient, QPainter,
+    QPainterPath, QPalette, QPen, QPixmap,
 )
 from PySide6.QtPositioning import QGeoPositionInfo, QGeoPositionInfoSource
 from PySide6.QtWidgets import (
-    QAbstractItemView, QApplication, QDialog, QHBoxLayout, QHeaderView, QLabel, QMainWindow,
-    QPushButton, QSizePolicy, QSpinBox, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
+    QAbstractItemView, QApplication, QDialog, QFrame, QGridLayout, QHBoxLayout, QHeaderView, QLabel,
+    QMainWindow, QPushButton, QScrollArea, QSizePolicy, QSpinBox, QTableWidget, QTableWidgetItem,
+    QVBoxLayout, QWidget,
 )
 try:  # Qt Multimedia plays the alarm; without it the app falls back to system beeps.
     from PySide6.QtMultimedia import QSoundEffect
@@ -127,9 +133,10 @@ class Debounce:
 
 
 def annotate(frame, result):
-    """Paint this result onto its own frame; return whether any person matches."""
+    """Paint this result onto its own frame.
+    Returns (whether any person matches, number of people detected)."""
     if result.boxes is None:
-        return False
+        return False, 0
     boxes = result.boxes.xyxy.cpu().numpy()
     points = result.keypoints.xy.cpu().numpy() if result.keypoints is not None else None
     any_fallen = False
@@ -150,7 +157,7 @@ def annotate(frame, result):
                 cv2.line(frame, tuple(map(int, joints[a])), tuple(map(int, joints[b])), color, 2, cv2.LINE_AA)
         for point in joints[visible]:
             cv2.circle(frame, tuple(map(int, point)), 3, color, -1, cv2.LINE_AA)
-    return bool(any_fallen)
+    return bool(any_fallen), len(boxes)
 
 
 def local_weights():
@@ -173,7 +180,8 @@ def open_camera(index: int = 0):
 
 
 class CameraThread(QThread):
-    frame_ready = Signal(QImage, bool)
+    # Annotated frame, debounced alert, debounce count (0..5), people detected.
+    frame_ready = Signal(QImage, bool, int, int)
     error = Signal(str)
 
     def __init__(self, parent=None):
@@ -205,9 +213,9 @@ class CameraThread(QThread):
                 if self.isInterruptionRequested():
                     break
                 result = model.predict(frame, device="cpu", verbose=False)[0]
-                is_fallen = debounce.update(annotate(frame, result))
-                cv2.putText(frame, f"Fall evidence: {debounce.count}/{CONSECUTIVE_FRAMES}", (16, 30),
-                            cv2.FONT_HERSHEY_SIMPLEX, .65, RED if is_fallen else GREEN, 2, cv2.LINE_AA)
+                matched, people = annotate(frame, result)
+                is_fallen = debounce.update(matched)
+                # The evidence count is shown by the sidebar meter, not drawn on the frame.
                 # At most ONE queued frame signal: a slow GUI cannot accumulate
                 # large image buffers. Inference/debounce still see every frame.
                 if not self._frame_pending.is_set() and not self.isInterruptionRequested():
@@ -215,7 +223,7 @@ class CameraThread(QThread):
                     h, w = rgb.shape[:2]
                     image = QImage(rgb.data, w, h, rgb.strides[0], QImage.Format.Format_RGB888).copy()
                     self._frame_pending.set()
-                    self.frame_ready.emit(image, is_fallen)
+                    self.frame_ready.emit(image, is_fallen, debounce.count, people)
         except Exception as exc:
             if not self.isInterruptionRequested():
                 self.error.emit(f"{type(exc).__name__}: {exc}")
@@ -378,6 +386,10 @@ class LocationFeed(QObject):
             return None
         lat, lon, accuracy, _taken, _received = fix
         return lat, lon, accuracy, label
+
+    def problem_text(self) -> str:
+        """Why there is no usable fix yet (for the sidebar)."""
+        return self._problems.get("system") or self._problems.get("gps") or "Locating…"
 
     def watermark_lines(self) -> list[str]:
         now = QDateTime.currentDateTime()
@@ -750,141 +762,701 @@ class AlarmSound(QObject):
 
 
 #Front end GUI BELOW.
+# ---------------------------------------------------------------------------
+# Design system: a dark "control room" theme. One accent (teal→sky) for
+# actions; green / orange / red reserved for state (clear / fall / alarm).
+# ---------------------------------------------------------------------------
+BG = "#0B0F14"
+SURFACE = "#11161E"
+SURFACE_2 = "#0D1218"
+BORDER = "#1E2733"
+TEXT = "#E6EDF5"
+MUTED = "#8A97A8"
+FAINT = "#5F6B7B"
+ACCENT = "#2DD4BF"
+ACCENT_2 = "#38BDF8"
+OK = "#34D399"
+AMBER = "#F5B83D"
+WARN = "#FF8A4C"
+DANGER = "#F04452"
+DANGER_DEEP = "#A51D2B"
+
+# state -> (header pill text, colour)
+STATE_STYLE = {
+    "idle": ("STANDBY", FAINT),
+    "starting": ("STARTING", ACCENT_2),
+    "monitoring": ("LIVE", OK),
+    "fall": ("FALL DETECTED", WARN),
+    "alarm": ("ALARM", DANGER),
+    "stopping": ("STOPPING", FAINT),
+    "error": ("ERROR", DANGER),
+}
+
+
+def rgba(color: str, alpha: float) -> str:
+    c = QColor(color)
+    return f"rgba({c.red()}, {c.green()}, {c.blue()}, {alpha:.2f})"
+
+
+def make_label(text: str = "", size: int = 14, weight=QFont.Weight.Normal, *, mono: bool = False,
+               obj: str | None = None, spacing: float = 0.0, wrap: bool = False) -> QLabel:
+    """Label with an explicit font, so typography never depends on stylesheet inheritance."""
+    label = QLabel(text)
+    font = QFontDatabase.systemFont(QFontDatabase.SystemFont.FixedFont) if mono else QFont(QApplication.font())
+    font.setPixelSize(size)
+    font.setWeight(weight)
+    if spacing:
+        font.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, spacing)
+    label.setFont(font)
+    if obj:
+        label.setObjectName(obj)
+    label.setWordWrap(wrap)
+    return label
+
+
+def caption(text: str) -> QLabel:
+    return make_label(text.upper(), 11, QFont.Weight.Bold, obj="caption", spacing=1.4)
+
+
+class LogoMark(QWidget):
+    """Brand mark: five stacked vertebrae in the accent gradient."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedSize(30, 36)
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        gradient = QLinearGradient(0, 0, 0, self.height())
+        gradient.setColorAt(0, QColor(ACCENT))
+        gradient.setColorAt(1, QColor(ACCENT_2))
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(gradient)
+        widths, height, gap = (12, 17, 22, 17, 12), 5.0, 2.4
+        top = (self.height() - (len(widths) * height + (len(widths) - 1) * gap)) / 2
+        for i, width in enumerate(widths):
+            painter.drawRoundedRect(QRectF((self.width() - width) / 2, top + i * (height + gap), width, height),
+                                    2.5, 2.5)
+        painter.end()
+
+
+class EvidenceMeter(QWidget):
+    """Five segments = the five consecutive positive frames needed for an alert."""
+
+    def __init__(self, segments: int = CONSECUTIVE_FRAMES, parent=None):
+        super().__init__(parent)
+        self.segments = segments
+        self.value = 0
+        self.setFixedHeight(12)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+
+    def set_value(self, value: int) -> None:
+        value = max(0, min(self.segments, value))
+        if value != self.value:
+            self.value = value
+            self.update()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setPen(Qt.PenStyle.NoPen)
+        gap = 6.0
+        width = (self.width() - gap * (self.segments - 1)) / self.segments
+        fill = QColor(DANGER if self.value >= self.segments else WARN if self.value >= 3 else AMBER)
+        for i in range(self.segments):
+            painter.setBrush(fill if i < self.value else QColor("#1C2531"))
+            painter.drawRoundedRect(QRectF(i * (width + gap), 0, width, self.height()), 4, 4)
+        painter.end()
+
+
+class StatTile(QFrame):
+    def __init__(self, title: str, parent=None):
+        super().__init__(parent)
+        self.setObjectName("tile")
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(14, 12, 14, 12)
+        layout.setSpacing(2)
+        self.value = make_label("—", 22, QFont.Weight.Bold, mono=True)
+        layout.addWidget(self.value)
+        layout.addWidget(make_label(title, 12, obj="muted"))
+
+    def set(self, text: str, color: str | None = None) -> None:
+        self.value.setText(text)
+        self.value.setStyleSheet(f"color: {color};" if color else "")
+
+
+class VideoView(QWidget):
+    """Live view drawn with rounded corners, a state-coloured border and a LIVE tag.
+    Draws in device pixels, so Retina and high-DPI Windows screens stay sharp."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._pixmap = None
+        self._title, self._detail = "Camera is off", "Press Start monitoring to begin."
+        self._border, self._border_width = QColor(BORDER), 1.0
+        self._live = False
+        self.setMinimumSize(480, 300)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+
+    def set_frame(self, pixmap: QPixmap) -> None:
+        self._pixmap = pixmap
+        self.update()
+
+    def show_message(self, title: str, detail: str) -> None:
+        self._pixmap, self._title, self._detail = None, title, detail
+        self.update()
+
+    def set_border(self, color: QColor, width: float, live: bool) -> None:
+        self._border, self._border_width, self._live = color, width, live
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHints(QPainter.RenderHint.Antialiasing | QPainter.RenderHint.SmoothPixmapTransform)
+        inset = self._border_width / 2 + 0.5
+        rect = QRectF(self.rect()).adjusted(inset, inset, -inset, -inset)
+        path = QPainterPath()
+        path.addRoundedRect(rect, 14, 14)
+        painter.fillPath(path, QColor("#06090D"))
+        if self._pixmap is not None and not self._pixmap.isNull():
+            painter.save()
+            painter.setClipPath(path)
+            scale = min(rect.width() / self._pixmap.width(), rect.height() / self._pixmap.height())
+            w, h = self._pixmap.width() * scale, self._pixmap.height() * scale
+            target = QRectF(rect.x() + (rect.width() - w) / 2, rect.y() + (rect.height() - h) / 2, w, h)
+            painter.drawPixmap(target, self._pixmap, QRectF(self._pixmap.rect()))
+            painter.restore()
+            if self._live:
+                self._paint_live_tag(painter, rect)
+        else:
+            self._paint_placeholder(painter, rect)
+        painter.setPen(QPen(self._border, self._border_width))
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawPath(path)
+        painter.end()
+
+    def _paint_live_tag(self, painter, rect):
+        font = QFont(QApplication.font())
+        font.setPixelSize(11)
+        font.setWeight(QFont.Weight.Bold)
+        font.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, 1.2)
+        painter.setFont(font)
+        text = "LIVE"
+        width = painter.fontMetrics().horizontalAdvance(text) + 30
+        tag = QRectF(rect.right() - width - 14, rect.top() + 14, width, 24)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(0, 0, 0, 150))
+        painter.drawRoundedRect(tag, 12, 12)
+        painter.setBrush(QColor(DANGER))
+        painter.drawEllipse(QRectF(tag.left() + 10, tag.center().y() - 4, 8, 8))
+        painter.setPen(QColor(TEXT))
+        painter.drawText(tag.adjusted(22, 0, 0, 0),
+                         int((Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft).value), text)
+
+    def _paint_placeholder(self, painter, rect):
+        # Subtle dot grid gives the empty panel depth without competing with content.
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(255, 255, 255, 10))
+        step = 28
+        y = rect.top() + step
+        while y < rect.bottom():
+            x = rect.left() + step
+            while x < rect.right():
+                painter.drawEllipse(QRectF(x - 1, y - 1, 2, 2))
+                x += step
+            y += step
+        cx, cy = rect.center().x(), rect.center().y() - 34
+        # Camera glyph: rounded body + lens.
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.setPen(QPen(QColor(FAINT), 2))
+        painter.drawRoundedRect(QRectF(cx - 30, cy - 20, 60, 40), 9, 9)
+        painter.drawEllipse(QRectF(cx - 11, cy - 11, 22, 22))
+        painter.drawRoundedRect(QRectF(cx - 12, cy - 27, 24, 7), 3, 3)
+        title_font = QFont(QApplication.font())
+        title_font.setPixelSize(19)
+        title_font.setWeight(QFont.Weight.DemiBold)
+        painter.setFont(title_font)
+        painter.setPen(QColor(TEXT))
+        painter.drawText(QRectF(rect.left() + 24, cy + 36, rect.width() - 48, 28),
+                         int(Qt.AlignmentFlag.AlignCenter.value), self._title)
+        detail_font = QFont(QApplication.font())
+        detail_font.setPixelSize(13)
+        painter.setFont(detail_font)
+        painter.setPen(QColor(MUTED))
+        painter.drawText(QRectF(rect.left() + 40, cy + 66, rect.width() - 80, 60),
+                         int((Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop).value)
+                         | int(Qt.TextFlag.TextWordWrap.value),
+                         self._detail)
+
+
+STYLESHEET = f"""
+QMainWindow, QDialog {{ background: {BG}; }}
+QWidget#root, QWidget#sideInner {{ background: transparent; }}
+QLabel {{ color: {TEXT}; background: transparent; }}
+QLabel#muted {{ color: {MUTED}; }}
+QLabel#caption {{ color: {FAINT}; }}
+QLabel#chip {{ color: #AEB9C7; background: {SURFACE}; border: 1px solid {BORDER};
+              border-radius: 12px; padding: 5px 12px; }}
+QLabel#dialogTitle {{ font-size: 22px; font-weight: 600; }}
+QLabel#subtitle {{ color: {MUTED}; }}
+QFrame#header {{ border: none; border-bottom: 1px solid #161D27; }}
+QFrame#card {{ background: {SURFACE}; border: 1px solid {BORDER}; border-radius: 16px; }}
+QFrame#tile {{ background: {SURFACE_2}; border: 1px solid #19212C; border-radius: 12px; }}
+
+QPushButton {{ color: {TEXT}; background: #18202B; border: 1px solid #263140;
+              border-radius: 10px; padding: 11px 20px; font-weight: 600; }}
+QPushButton:hover {{ background: #1E2835; border-color: #33404F; }}
+QPushButton:pressed {{ background: #151C26; }}
+QPushButton:disabled {{ color: #4E5A69; background: #121820; border-color: #1A222D; }}
+QPushButton#primary {{ color: #04131A; border: none; font-weight: 700;
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 {ACCENT}, stop:1 {ACCENT_2}); }}
+QPushButton#primary:hover {{
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #5EEAD4, stop:1 #7DD3FC); }}
+QPushButton#primary:disabled {{ color: #4E5A69; background: #121820; border: 1px solid #1A222D; }}
+QPushButton#ghost {{ background: transparent; }}
+QPushButton#ghost:hover {{ background: #18202B; }}
+QPushButton#ghost:disabled {{ background: transparent; }}
+QPushButton#step {{ padding: 0px; min-width: 34px; max-width: 34px; min-height: 34px; max-height: 34px;
+                   border-radius: 9px; font-size: 18px; }}
+QPushButton#silence {{ color: {DANGER_DEEP}; background: #FFFFFF; border: none; font-weight: 800;
+                      padding: 11px 22px; }}
+QPushButton#silence:hover {{ background: #FFE4E6; }}
+
+QSpinBox {{ color: {TEXT}; background: {SURFACE_2}; border: 1px solid #263140; border-radius: 9px;
+           padding: 6px 4px; min-width: 72px; min-height: 20px; font-weight: 700;
+           selection-background-color: #2B6F8F; }}
+QSpinBox:focus {{ border-color: {ACCENT}; }}
+
+QScrollArea {{ background: transparent; border: none; }}
+QScrollBar:vertical {{ background: transparent; width: 8px; margin: 2px; }}
+QScrollBar::handle:vertical {{ background: #263140; border-radius: 4px; min-height: 30px; }}
+QScrollBar::handle:vertical:hover {{ background: #33404F; }}
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0px; }}
+QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {{ background: none; }}
+
+QToolTip {{ color: {TEXT}; background: #18202B; border: 1px solid #2A3644; padding: 6px 8px; }}
+
+QTableWidget {{ color: {TEXT}; background: {SURFACE_2}; alternate-background-color: {SURFACE};
+               gridline-color: #19212C; border: 1px solid {BORDER}; border-radius: 12px; }}
+QTableWidget::item {{ padding: 6px 10px; }}
+QTableWidget::item:selected {{ background: #1F3A4D; color: {TEXT}; }}
+QHeaderView::section {{ background: #141B24; color: {MUTED}; border: none;
+                       border-bottom: 1px solid {BORDER}; padding: 9px 10px; font-weight: 600; }}
+"""
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.worker = None
-        self._pixmap = None
-        self._alert = False
-        self._flash_on = False
         self._stopping = False
         self._closing = False
         self._error = None
+        self._state = None
+        self._state_detail = None
+        self._flash = False
+        self._people = 0
+        self._frame_times = deque(maxlen=30)
+        self._falls_today = 0
         self.location = LocationFeed(self)
         self.fall_log = FallLog(device_name())
         self.log_dialog = None
         self.alarm = AlarmSound(self)
         self.settings = QSettings("Vertebrate", "Vertebrate")  # per-user, per-device preferences
-        self.setWindowTitle("Live Pose · Fall Detection")
-        self.resize(1120, 800)
-        self.setMinimumSize(640, 480)
-        container = QWidget()
-        layout = QVBoxLayout(container)
-        layout.setContentsMargins(24, 20, 24, 20)
-        layout.setSpacing(14)
-        title = QLabel("Live Pose")
-        title.setObjectName("title")
-        layout.addWidget(title)
-        subtitle = QLabel("Local webcam · YOLO11 pose · five consecutive processed frames")
-        subtitle.setObjectName("subtitle")
-        layout.addWidget(subtitle)
-        self.video = QLabel("Press Start to open your webcam")
-        self.video.setObjectName("video")
-        self.video.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.video.setMinimumSize(320, 240)
-        self.video.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Expanding)
-        layout.addWidget(self.video, 1)
-        self.status = QLabel("Camera stopped")
-        self.status.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.status.setWordWrap(True)
-        self.status.setMinimumHeight(56)
-        layout.addWidget(self.status)
-        controls = QHBoxLayout()
-        self.start_button = QPushButton("Start camera")
-        self.stop_button = QPushButton("Stop")
-        self.stop_button.setEnabled(False)
-        self.log_button = QPushButton()
-        self.log_button.setObjectName("logButton")
-        self.log_button.setToolTip(f"Falls recorded on {self.fall_log.device}")
-        self.silence_button = QPushButton("🔕  Silence alarm")
-        self.silence_button.setObjectName("silenceButton")
-        self.silence_button.setVisible(False)
-        alarm_label = QLabel("Alarm if fallen for")
-        alarm_label.setObjectName("subtitle")
-        self.alarm_delay = QSpinBox()
-        self.alarm_delay.setRange(0, ALARM_MAX_S)
-        self.alarm_delay.setSingleStep(5)
-        self.alarm_delay.setSuffix(" s")
-        self.alarm_delay.setSpecialValueText("Off")  # shown at 0
-        self.alarm_delay.setToolTip("Ring an alarm on this device when a detected fall lasts this long. "
-                                    "0 turns the alarm off.")
-        try:
-            saved = int(self.settings.value("alarm_after_s", ALARM_DEFAULT_S))
-        except (TypeError, ValueError):
-            saved = ALARM_DEFAULT_S
-        self.alarm_delay.setValue(min(max(saved, 0), ALARM_MAX_S))
-        controls.addWidget(self.start_button)
-        controls.addWidget(self.stop_button)
-        controls.addWidget(self.silence_button)
-        controls.addStretch()
-        controls.addWidget(alarm_label)
-        controls.addWidget(self.alarm_delay)
-        controls.addSpacing(12)
-        controls.addWidget(self.log_button)
-        layout.addLayout(controls)
-        footer = QLabel("Local demo — no external emergency dispatch")
-        footer.setObjectName("subtitle")
-        layout.addWidget(footer)
-        self.setCentralWidget(container)
-        # No font-family here: the platform's system font is set in main().
-        self.setStyleSheet("""
-            QMainWindow, QWidget { background: #141820; color: #e7ecf4; font-size: 14px; }
-            QLabel#title { font-size: 30px; font-weight: 600; }
-            QLabel#subtitle { color: #9ba8bb; }
-            QLabel#video { background: #090c11; border: 1px solid #303846; border-radius: 10px; }
-            QPushButton { background: #344b68; border: 1px solid #50647d; border-radius: 7px; padding: 12px 24px; }
-            QPushButton:hover { background: #425f83; }
-            QPushButton:disabled { background: #222832; color: #737e8d; border-color: #303846; }
-            QPushButton#logButton { background: #2a3140; }
-            QPushButton#logButton:hover { background: #374155; }
-            QPushButton#silenceButton { background: #b52e3c; border-color: #e0525f; font-weight: 700; }
-            QPushButton#silenceButton:hover { background: #cc3a49; }
-            QSpinBox { background: #0f131a; border: 1px solid #50647d; border-radius: 7px;
-                       padding: 8px 10px; min-width: 84px; }
-            QLabel#dialogTitle { font-size: 22px; font-weight: 600; }
-            QTableWidget { background: #0f131a; alternate-background-color: #151b24;
-                           gridline-color: #262e3b; border: 1px solid #303846; border-radius: 8px; }
-            QTableWidget::item { padding: 6px 10px; }
-            QTableWidget::item:selected { background: #344b68; }
-            QHeaderView::section { background: #1c2330; color: #9ba8bb; border: none;
-                                   border-bottom: 1px solid #303846; padding: 8px 10px; font-weight: 600; }
-        """)
+        self.setWindowTitle("Vertebrate · Fall Monitor")
+        self.resize(1360, 860)
+        self.setMinimumSize(1000, 640)
+
+        root = QWidget()
+        root.setObjectName("root")
+        outer = QVBoxLayout(root)
+        outer.setContentsMargins(28, 18, 28, 16)
+        outer.setSpacing(18)
+        outer.addWidget(self._build_header())
+        body = QHBoxLayout()
+        body.setSpacing(20)
+        body.addLayout(self._build_main(), 1)
+        body.addWidget(self._build_sidebar())
+        outer.addLayout(body, 1)
+        footer = make_label("Processing stays on this device  ·  Local alarm only — no external emergency dispatch",
+                            12, obj="caption")
+        outer.addWidget(footer)
+        self.setCentralWidget(root)
+        self.setStyleSheet(STYLESHEET)
+
         self.start_button.clicked.connect(self.start_camera)
         self.stop_button.clicked.connect(self.stop_camera)
         self.log_button.clicked.connect(self.open_log)
         self.silence_button.clicked.connect(self.silence_alarm)
         self.alarm_delay.valueChanged.connect(self.alarm_delay_changed)
-        self.update_log_button()
-        # Checks the ongoing fall against the alarm delay independently of frame rate.
-        self.alarm_timer = QTimer(self)
-        self.alarm_timer.setInterval(250)
-        self.alarm_timer.timeout.connect(self.check_alarm)
-        self.flash_timer = QTimer(self)
+        self.flash_timer = QTimer(self)  # pulses fall/alarm visuals
         self.flash_timer.setInterval(450)
         self.flash_timer.timeout.connect(self.flash_alert)
         self.stop_timer = QTimer(self)
         self.stop_timer.setSingleShot(True)
         self.stop_timer.setInterval(5000)
         self.stop_timer.timeout.connect(self.stop_timeout)
-        self.set_status("Camera stopped")
+        # Checks the ongoing fall against the alarm delay independently of frame rate.
+        self.alarm_timer = QTimer(self)
+        self.alarm_timer.setInterval(250)
+        self.alarm_timer.timeout.connect(self.check_alarm)
+        self.clock_timer = QTimer(self)  # header clock, location card, stats decay
+        self.clock_timer.setInterval(1000)
+        self.clock_timer.timeout.connect(self.tick)
+        self.clock_timer.start()
 
-    def set_status(self, text, color="#233044"):
-        self.status.setText(text)
-        self.status.setStyleSheet(f"background: {color}; color: #ffffff; border-radius: 8px; padding: 10px; font-size: 19px; font-weight: 600;")
+        self.update_log_button()
+        self.alarm_delay_changed(self.alarm_delay.value(), save=False)
+        self.set_state("idle")
+        self.tick()
 
+    # -- layout --------------------------------------------------------------
+    def _build_header(self) -> QFrame:
+        header = QFrame()
+        header.setObjectName("header")
+        row = QHBoxLayout(header)
+        row.setContentsMargins(0, 0, 0, 16)
+        row.setSpacing(14)
+        row.addWidget(LogoMark())
+        names = QVBoxLayout()
+        names.setSpacing(1)
+        names.addWidget(make_label("VERTEBRATE", 18, QFont.Weight.Bold, spacing=3.0))
+        names.addWidget(make_label("Fall-posture monitoring", 12, obj="muted"))
+        row.addLayout(names)
+        row.addStretch()
+        device = make_label(self.fall_log.device, 12, obj="chip")
+        device.setToolTip("This device. Its fall log and alarm setting are kept separately.")
+        row.addWidget(device)
+        self.clock_label = make_label("", 13, mono=True, obj="muted")
+        row.addWidget(self.clock_label)
+        row.addSpacing(4)
+        self.pill = make_label("", 12, QFont.Weight.Bold, spacing=1.0)
+        row.addWidget(self.pill)
+        return header
+
+    def _build_main(self) -> QVBoxLayout:
+        column = QVBoxLayout()
+        column.setSpacing(14)
+
+        self.banner = QFrame()
+        self.banner.setObjectName("banner")
+        self.banner.setVisible(False)
+        banner = QHBoxLayout(self.banner)
+        banner.setContentsMargins(16, 12, 12, 12)
+        banner.setSpacing(14)
+        self.banner_icon = make_label("!", 20, QFont.Weight.Black)
+        self.banner_icon.setFixedSize(36, 36)
+        self.banner_icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        texts = QVBoxLayout()
+        texts.setSpacing(2)
+        self.banner_title = make_label("", 17, QFont.Weight.Bold)
+        self.banner_detail = make_label("", 13, wrap=True)
+        texts.addWidget(self.banner_title)
+        texts.addWidget(self.banner_detail)
+        self.silence_button = QPushButton("Silence alarm")
+        self.silence_button.setObjectName("silence")
+        self.silence_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.silence_button.setVisible(False)
+        banner.addWidget(self.banner_icon)
+        banner.addLayout(texts, 1)
+        banner.addWidget(self.silence_button)
+        column.addWidget(self.banner)
+
+        card = QFrame()
+        card.setObjectName("card")
+        inner = QVBoxLayout(card)
+        inner.setContentsMargins(16, 14, 16, 16)
+        inner.setSpacing(12)
+        top = QHBoxLayout()
+        top.addWidget(caption("Live view"))
+        top.addStretch()
+        top.addWidget(make_label("Camera 0  ·  YOLO11n pose  ·  on-device CPU", 12, obj="muted"))
+        inner.addLayout(top)
+        self.video = VideoView()
+        inner.addWidget(self.video, 1)
+        column.addWidget(card, 1)
+
+        controls = QHBoxLayout()
+        controls.setSpacing(10)
+        self.start_button = QPushButton("Start monitoring")
+        self.start_button.setObjectName("primary")
+        self.stop_button = QPushButton("Stop")
+        self.stop_button.setObjectName("ghost")
+        self.stop_button.setEnabled(False)
+        self.log_button = QPushButton("Fall log")
+        self.log_button.setObjectName("ghost")
+        self.log_button.setToolTip(f"Falls recorded on {self.fall_log.device}")
+        for button in (self.start_button, self.stop_button, self.log_button):
+            button.setCursor(Qt.CursorShape.PointingHandCursor)
+        controls.addWidget(self.start_button)
+        controls.addWidget(self.stop_button)
+        controls.addStretch()
+        controls.addWidget(self.log_button)
+        column.addLayout(controls)
+        return column
+
+    def _card(self, title: str):
+        card = QFrame()
+        card.setObjectName("card")
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(18, 16, 18, 18)
+        layout.setSpacing(12)
+        layout.addWidget(caption(title))
+        return card, layout
+
+    def _build_sidebar(self) -> QScrollArea:
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFixedWidth(360)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.viewport().setStyleSheet("background: transparent;")
+        inner = QWidget()
+        inner.setObjectName("sideInner")
+        column = QVBoxLayout(inner)
+        column.setContentsMargins(0, 0, 8, 0)
+        column.setSpacing(14)
+
+        self.status_card = QFrame()
+        self.status_card.setObjectName("statusCard")
+        status = QVBoxLayout(self.status_card)
+        status.setContentsMargins(18, 16, 18, 18)
+        status.setSpacing(6)
+        status.addWidget(caption("Status"))
+        self.status_title = make_label("", 26, QFont.Weight.Bold)
+        self.status_detail = make_label("", 13, obj="muted", wrap=True)
+        status.addWidget(self.status_title)
+        status.addWidget(self.status_detail)
+        column.addWidget(self.status_card)
+
+        card, layout = self._card("Fall evidence")
+        self.meter = EvidenceMeter()
+        layout.addWidget(self.meter)
+        row = QHBoxLayout()
+        self.evidence_label = make_label(f"0 of {CONSECUTIVE_FRAMES} frames", 13, QFont.Weight.DemiBold, mono=True)
+        row.addWidget(self.evidence_label)
+        row.addStretch()
+        row.addWidget(make_label(f"Alert after {CONSECUTIVE_FRAMES} in a row", 12, obj="muted"))
+        layout.addLayout(row)
+        column.addWidget(card)
+
+        card, layout = self._card("Live stats")
+        grid = QGridLayout()
+        grid.setSpacing(10)
+        self.stat_people = StatTile("People in view")
+        self.stat_fps = StatTile("Frames / second")
+        self.stat_today = StatTile("Falls today")
+        self.stat_alarm = StatTile("Alarm in")
+        grid.addWidget(self.stat_people, 0, 0)
+        grid.addWidget(self.stat_fps, 0, 1)
+        grid.addWidget(self.stat_today, 1, 0)
+        grid.addWidget(self.stat_alarm, 1, 1)
+        layout.addLayout(grid)
+        column.addWidget(card)
+
+        card, layout = self._card("Location")
+        self.location_coords = make_label("—", 15, QFont.Weight.DemiBold, mono=True, wrap=True)
+        self.location_detail = make_label("", 12, obj="muted", wrap=True)
+        layout.addWidget(self.location_coords)
+        layout.addWidget(self.location_detail)
+        column.addWidget(card)
+
+        card, layout = self._card("Emergency alarm")
+        row = QHBoxLayout()
+        row.setSpacing(8)
+        row.addWidget(make_label("Ring if fallen for", 14))
+        row.addStretch()
+        minus = QPushButton("−")
+        plus = QPushButton("+")
+        self.alarm_delay = QSpinBox()
+        self.alarm_delay.setRange(0, ALARM_MAX_S)
+        self.alarm_delay.setSingleStep(5)
+        self.alarm_delay.setSuffix(" s")
+        self.alarm_delay.setSpecialValueText("Off")  # shown at 0
+        self.alarm_delay.setButtonSymbols(QSpinBox.ButtonSymbols.NoButtons)
+        self.alarm_delay.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.alarm_delay.setToolTip("Seconds a fall may last before the siren rings. 0 turns the alarm off.")
+        try:
+            saved = int(self.settings.value("alarm_after_s", ALARM_DEFAULT_S))
+        except (TypeError, ValueError):
+            saved = ALARM_DEFAULT_S
+        self.alarm_delay.setValue(min(max(saved, 0), ALARM_MAX_S))
+        for button, steps in ((minus, -1), (plus, 1)):
+            button.setObjectName("step")
+            button.setCursor(Qt.CursorShape.PointingHandCursor)
+            button.setAutoRepeat(True)
+            button.clicked.connect(lambda _checked=False, s=steps: self.alarm_delay.stepBy(s))
+        row.addWidget(minus)
+        row.addWidget(self.alarm_delay)
+        row.addWidget(plus)
+        layout.addLayout(row)
+        self.alarm_hint = make_label("", 12, obj="muted", wrap=True)
+        layout.addWidget(self.alarm_hint)
+        column.addWidget(card)
+
+        column.addStretch()
+        scroll.setWidget(inner)
+        return scroll
+
+    # -- state & visuals -----------------------------------------------------
+    def set_state(self, state: str, detail: str | None = None) -> None:
+        self._state, self._state_detail = state, detail
+        if state in ("fall", "alarm"):
+            if not self.flash_timer.isActive():
+                self._flash = True
+                self.flash_timer.start()
+        else:
+            self.flash_timer.stop()
+            self._flash = False
+        self.apply_state()
+
+    def _fall_detail(self) -> str:
+        current = self.fall_log.current
+        fallen_for = format_duration(self.fall_log.ongoing_seconds())
+        delay = self.alarm_delay.value()
+        if current is None:
+            return "Fall posture detected."
+        if delay == 0:
+            return f"Fallen for {fallen_for}. The alarm is off."
+        if current["alarm_rang"] is None:
+            return f"Fallen for {fallen_for}. Alarm in {self._alarm_remaining()} s."
+        return f"Fallen for {fallen_for}. Alarm silenced."
+
+    def _alarm_remaining(self) -> int:
+        return max(0, int(self.alarm_delay.value() - self.fall_log.ongoing_seconds() + 0.999))
+
+    def apply_state(self) -> None:
+        state = self._state
+        pill_text, color = STATE_STYLE[state]
+        if state == "alarm":
+            color = DANGER if self._flash else DANGER_DEEP
+        title, detail = {
+            "idle": ("Standby", "Camera is off. Press Start monitoring to begin."),
+            "starting": ("Starting…", "Loading the pose model and opening the camera."),
+            "monitoring": ("All clear", self._monitoring_detail()),
+            "fall": ("Fall detected", self._fall_detail()),
+            "alarm": ("Emergency alarm",
+                      f"Fallen for {format_duration(self.fall_log.ongoing_seconds())}. Siren ringing on this device."),
+            "stopping": ("Stopping…", "Releasing the camera."),
+            "error": ("Something went wrong", "Check the message below and try again."),
+        }[state]
+        if self._state_detail:
+            detail = self._state_detail
+
+        self.pill.setText(f"●  {pill_text}")
+        self.pill.setStyleSheet(
+            f"QLabel {{ color: {color}; background: {rgba(color, .12)}; border: 1px solid {rgba(color, .38)};"
+            f" border-radius: 12px; padding: 5px 12px; }}")
+        self.status_title.setText(title)
+        self.status_title.setStyleSheet(f"color: {TEXT if state in ('idle', 'stopping') else color};")
+        self.status_detail.setText(detail)
+        self.status_card.setStyleSheet(
+            f"QFrame#statusCard {{ border: 1px solid {rgba(color, .40)}; border-radius: 16px;"
+            f" background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 {rgba(color, .18)},"
+            f" stop:0.65 {SURFACE}, stop:1 {SURFACE}); }}")
+
+        live = state in ("monitoring", "fall", "alarm")
+        border = {"monitoring": (QColor(OK), 1.5), "fall": (QColor(WARN), 2.5 if self._flash else 1.5),
+                  "alarm": (QColor(color), 3.0), "error": (QColor(DANGER), 1.5)}.get(state, (QColor(BORDER), 1.0))
+        if state == "monitoring":
+            border[0].setAlpha(110)
+        self.video.set_border(border[0], border[1], live)
+
+        if state == "fall":
+            self.banner_title.setText("Fall detected")
+            self.banner_detail.setText(self._fall_detail())
+            self.banner.setStyleSheet(
+                f"QFrame#banner {{ background: {rgba(WARN, .13)}; border: 1px solid {rgba(WARN, .55)};"
+                f" border-radius: 14px; }} QLabel {{ color: {TEXT}; }}")
+            self.banner_icon.setStyleSheet(f"color: #1A0E06; background: {WARN}; border-radius: 18px;")
+        elif state == "alarm":
+            self.banner_title.setText(f"EMERGENCY ALARM — fallen for {format_duration(self.fall_log.ongoing_seconds())}")
+            self.banner_detail.setText("A siren is ringing on this device. Check on the person, then silence it.")
+            self.banner.setStyleSheet(
+                f"QFrame#banner {{ background: {color}; border: 1px solid {rgba('#FFFFFF', .25)};"
+                f" border-radius: 14px; }} QLabel {{ color: #FFFFFF; }}")
+            self.banner_icon.setStyleSheet(f"color: {DANGER_DEEP}; background: #FFFFFF; border-radius: 18px;")
+        self.banner.setVisible(state in ("fall", "alarm"))
+        self.silence_button.setVisible(state == "alarm" and self.alarm.ringing)
+        self.refresh_stats()
+
+    def _monitoring_detail(self) -> str:
+        people = "No one in view" if self._people == 0 else (
+            "1 person in view" if self._people == 1 else f"{self._people} people in view")
+        return f"{people}. No fall posture detected."
+
+    def refresh_live_text(self) -> None:
+        """Per-frame update: text only. Stylesheets change only when the state does."""
+        if self._state == "monitoring" and not self._state_detail:
+            self.status_detail.setText(self._monitoring_detail())
+        self.refresh_stats()
+
+    def refresh_stats(self) -> None:
+        running = self.worker is not None and self._state in ("monitoring", "fall", "alarm")
+        self.stat_people.set(str(self._people) if running else "—")
+        now = time.monotonic()
+        recent = [t for t in self._frame_times if now - t <= 2.0]
+        fps = (len(recent) - 1) / (recent[-1] - recent[0]) if len(recent) > 1 and recent[-1] > recent[0] else 0.0
+        self.stat_fps.set(f"{fps:.1f}" if running else "—")
+        self.stat_today.set(str(self._falls_today), WARN if self._falls_today else None)
+        delay = self.alarm_delay.value()
+        current = self.fall_log.current
+        if delay == 0:
+            self.stat_alarm.set("Off", FAINT)
+        elif self.alarm.ringing:
+            self.stat_alarm.set("Now", DANGER)
+        elif current is not None and current["alarm_rang"] is None:
+            self.stat_alarm.set(f"{self._alarm_remaining()} s", WARN)
+        else:
+            self.stat_alarm.set(f"{delay} s")
+        self.evidence_label.setText(f"{self.meter.value} of {CONSECUTIVE_FRAMES} frames")
+
+    def refresh_location(self) -> None:
+        fix = self.location.current_fix()
+        if fix is None:
+            running = self.worker is not None
+            self.location_coords.setText("—")
+            self.location_detail.setText(self.location.problem_text() if running
+                                         else "Starts with monitoring. Shown on the video as a watermark.")
+            return
+        lat, lon, accuracy, source = fix
+        self.location_coords.setText(
+            f"{abs(lat):.5f}° {'N' if lat >= 0 else 'S'}\n{abs(lon):.5f}° {'E' if lon >= 0 else 'W'}")
+        detail = f"±{accuracy:.0f} m  ·  via {source}" if accuracy else f"via {source}"
+        self.location_detail.setText(detail)
+
+    @Slot()
+    def tick(self):
+        self.clock_label.setText(QDateTime.currentDateTime().toString("ddd d MMM  ·  HH:mm:ss"))
+        self.refresh_location()
+        if self._state in ("fall", "alarm"):
+            return  # flash_alert already refreshes these twice a second
+        self.refresh_stats()
+
+    @Slot()
+    def flash_alert(self):
+        self._flash = not self._flash
+        self.apply_state()
+
+    # -- camera lifecycle ----------------------------------------------------
     @Slot()
     def start_camera(self):
         if self.worker is not None:
             return
         self._error = None
         self._stopping = False
+        self._frame_times.clear()
+        self._people = 0
+        self.meter.set_value(0)
         self.start_button.setEnabled(False)
         self.stop_button.setEnabled(True)
-        self.set_status("Loading local model and opening camera…")
+        self.video.show_message("Starting camera…", "Loading the pose model. This takes a few seconds.")
         self.worker = CameraThread(self)
         self.worker.frame_ready.connect(self.show_frame, Qt.ConnectionType.QueuedConnection)
         self.worker.error.connect(self.show_error, Qt.ConnectionType.QueuedConnection)
         self.worker.finished.connect(self.camera_finished, Qt.ConnectionType.QueuedConnection)
+        self.set_state("starting")
         self.location.start()
         self.alarm_timer.start()
         self.worker.start()
@@ -894,58 +1466,83 @@ class MainWindow(QMainWindow):
         if self.worker is None or self._stopping:
             return
         self._stopping = True
-        self.flash_timer.stop()
         self.stop_alarm()  # Someone is at the device; stopping the camera also stops the alarm.
-        self._alert = False
         self.stop_button.setEnabled(False)
         self.worker.requestInterruption()
-        self.set_status("Stopping camera…")
+        self.set_state("stopping")
         self.stop_timer.start()
 
-    @Slot(QImage, bool)
-    def show_frame(self, image, is_fallen):
+    @Slot(QImage, bool, int, int)
+    def show_frame(self, image, is_fallen, evidence, people):
         worker = self.sender()
         try:
             if worker is not self.worker or self._stopping:
                 return
             paint_watermark(image, self.location.watermark_lines())  # image is our detached copy
-            self._pixmap = QPixmap.fromImage(image)
-            self.fit_video()
+            self.video.set_frame(QPixmap.fromImage(image))
+            self._frame_times.append(time.monotonic())
+            self._people = people
+            self.meter.set_value(evidence)
             if self.fall_log.update(is_fallen, self.location.current_fix()):
                 self.log_changed()
-            # Keep flashing while the alarm rings, even if one frame misses the person.
-            if is_fallen or self.alarm.ringing:
-                if not self._alert:
-                    self._alert = True
-                    self._flash_on = False
-                    self.flash_alert()
-                    self.flash_timer.start()
-            else:
-                self._alert = False
-                self.flash_timer.stop()
-                self.set_status("Monitoring · no confirmed fall", "#1e4336")
             self.check_alarm()
+            # An ongoing fall event (including its 2 s grace) keeps the fall state,
+            # so the banner does not flicker on single missed frames.
+            if self.alarm.ringing:
+                state = "alarm"
+            elif is_fallen or self.fall_log.current is not None:
+                state = "fall"
+            else:
+                state = "monitoring"
+            if state != self._state:
+                self.set_state(state)
+            elif state == "monitoring":
+                self.refresh_live_text()  # people count / stats
         finally:
             if worker is not None:
                 worker.frame_consumed()
 
-    @Slot()
-    def flash_alert(self):
-        self._flash_on = not self._flash_on
-        delay = self.alarm_delay.value()
-        current = self.fall_log.current
-        fallen_for = self.fall_log.ongoing_seconds()
-        if self.alarm.ringing:
-            text = f"🚨 EMERGENCY ALARM · fallen for {format_duration(fallen_for)} 🚨"
-            colors = ("#e0262f", "#7a0f17")
-        elif current is not None and delay > 0 and current["alarm_rang"] is None:
-            text = f"🚨 FALL DETECTED · alarm in {max(0, int(delay - fallen_for + 0.999))} s 🚨"
-            colors = ("#b52e3c", "#631e2a")
-        else:
-            text = "🚨 FALL DETECTED 🚨"
-            colors = ("#b52e3c", "#631e2a")
-        self.set_status(text, colors[0] if self._flash_on else colors[1])
+    @Slot(str)
+    def show_error(self, message):
+        self._error = message
+        self.stop_alarm()
+        self.set_state("error", message)
 
+    @Slot()
+    def camera_finished(self):
+        self.stop_timer.stop()
+        self.alarm_timer.stop()
+        self.stop_alarm()
+        # A fall still in progress ends here; record why.
+        reason = f"Error: {self._error}" if self._error else ("App closed" if self._closing else "Camera stopped")
+        if self.fall_log.close_event(reason):
+            self.log_changed()
+        self.location.stop()
+        worker = self.worker
+        self.worker = None
+        if worker is not None:
+            worker.deleteLater()
+        self._stopping = False
+        self._people = 0
+        self._frame_times.clear()
+        self.meter.set_value(0)
+        self.start_button.setEnabled(True)
+        self.stop_button.setEnabled(False)
+        if self._error:
+            self.video.show_message("Camera unavailable", self._error)
+            self.set_state("error", self._error)
+        else:
+            self.video.show_message("Camera is off", "Press Start monitoring to begin.")
+            self.set_state("idle")
+        if self._closing:
+            self.close()
+
+    @Slot()
+    def stop_timeout(self):
+        if self.worker is not None:
+            self.set_state("stopping", "The camera driver has not released yet. This window stays responsive.")
+
+    # -- alarm ---------------------------------------------------------------
     @Slot()
     def check_alarm(self):
         """Ring once per fall when it has lasted the chosen delay; stop when it ends."""
@@ -953,17 +1550,18 @@ class MainWindow(QMainWindow):
         if current is None:
             if self.alarm.ringing:
                 self.stop_alarm()  # The fall ended (posture cleared or camera stopped).
+                if self._state == "alarm":
+                    self.set_state("monitoring")
             return
         delay = self.alarm_delay.value()
         if (delay > 0 and not self.alarm.ringing and current["alarm_rang"] is None
                 and self.fall_log.ongoing_seconds() >= delay):
             self.fall_log.mark_alarm(delay)
             self.alarm.start()
-            self.silence_button.setVisible(True)
+            self.set_state("alarm")
             self.silence_button.setFocus()  # Space/Enter silences it
             self.raise_()
             self.activateWindow()
-            self.flash_alert()
             self.log_changed()
 
     @Slot()
@@ -972,52 +1570,32 @@ class MainWindow(QMainWindow):
             self.fall_log.mark_silenced()
             self.log_changed()
         self.stop_alarm()
+        if self._state == "alarm":
+            self.set_state("fall" if self.fall_log.current is not None else "monitoring")
 
     def stop_alarm(self):
         self.alarm.stop()
         self.silence_button.setVisible(False)
 
     @Slot(int)
-    def alarm_delay_changed(self, value):
-        self.settings.setValue("alarm_after_s", value)
+    def alarm_delay_changed(self, value, save=True):
+        if save:
+            self.settings.setValue("alarm_after_s", value)
+        self.alarm_hint.setText(
+            "Falls are still logged, but no siren will ring." if value == 0 else
+            f"A siren sounds on this device if a fall lasts {format_duration(value)}. "
+            "It stops when the person gets up or someone silences it.")
         if value == 0 and self.alarm.ringing:
             self.silence_alarm()  # Turning the alarm off while it rings silences it.
+        if self._state is not None:
+            self.apply_state()
 
-    @Slot(str)
-    def show_error(self, message):
-        self._error = message
-        self.flash_timer.stop()
-        self.set_status(message, "#631e2a")
-
-    @Slot()
-    def camera_finished(self):
-        self.stop_timer.stop()
-        self.flash_timer.stop()
-        self.alarm_timer.stop()
-        self.stop_alarm()
-        # A fall still in progress ends here; record why.
-        reason = f"Error: {self._error}" if self._error else ("App closed" if self._closing else "Camera stopped")
-        if self.fall_log.close_event(reason):
-            self.log_changed()
-        self.location.stop()
-        self._alert = False
-        worker = self.worker
-        self.worker = None
-        if worker is not None:
-            worker.deleteLater()
-        self._stopping = False
-        self.start_button.setEnabled(True)
-        self.stop_button.setEnabled(False)
-        self._pixmap = None
-        self.video.clear()
-        self.video.setText("Press Start to open your webcam")
-        self.set_status(self._error or "Camera stopped", "#631e2a" if self._error else "#233044")
-        if self._closing:
-            self.close()
-
+    # -- fall log ------------------------------------------------------------
     def update_log_button(self):
-        count = len(self.fall_log.rows())
-        self.log_button.setText(f"Fall log ({count})" if count else "Fall log")
+        rows = self.fall_log.rows()
+        today = datetime.now().strftime("%Y-%m-%d")
+        self._falls_today = sum(1 for row in rows if row.get("fall_detected_at", "").startswith(today))
+        self.log_button.setText(f"Fall log  ·  {len(rows)}" if rows else "Fall log")
 
     def log_changed(self):
         self.update_log_button()
@@ -1032,24 +1610,6 @@ class MainWindow(QMainWindow):
         self.log_dialog.raise_()
         self.log_dialog.activateWindow()
 
-    @Slot()
-    def stop_timeout(self):
-        if self.worker is not None:
-            self.set_status("Camera/model has not stopped yet. Waiting for the driver; this window remains responsive.", "#631e2a")
-
-    def fit_video(self):
-        if self._pixmap is not None:
-            # Scale in physical pixels so Retina / high-DPI Windows displays stay sharp.
-            ratio = self.video.devicePixelRatioF()
-            scaled = self._pixmap.scaled(self.video.size() * ratio, Qt.AspectRatioMode.KeepAspectRatio,
-                                         Qt.TransformationMode.SmoothTransformation)
-            scaled.setDevicePixelRatio(ratio)
-            self.video.setPixmap(scaled)
-
-    def resizeEvent(self, event):
-        super().resizeEvent(event)
-        self.fit_video()
-
     def closeEvent(self, event: QCloseEvent):
         if self.worker is not None:
             self._closing = True
@@ -1059,10 +1619,34 @@ class MainWindow(QMainWindow):
             event.accept()
 
 
+def apply_dark_theme(application: QApplication) -> None:
+    """Fusion + a dark palette gives the same look on Windows and macOS."""
+    application.setStyle("Fusion")
+    try:  # Qt 6.8+: dark native title bars on Windows 11 and macOS.
+        application.styleHints().setColorScheme(Qt.ColorScheme.Dark)
+    except AttributeError:
+        pass
+    palette = QPalette()
+    roles = QPalette.ColorRole
+    for role, color in ((roles.Window, BG), (roles.WindowText, TEXT), (roles.Base, SURFACE_2),
+                        (roles.AlternateBase, SURFACE), (roles.Text, TEXT), (roles.Button, "#18202B"),
+                        (roles.ButtonText, TEXT), (roles.Highlight, "#2B6F8F"), (roles.HighlightedText, "#FFFFFF"),
+                        (roles.ToolTipBase, "#18202B"), (roles.ToolTipText, TEXT), (roles.PlaceholderText, FAINT),
+                        (roles.Link, ACCENT_2)):
+        palette.setColor(role, QColor(color))
+    for role in (roles.Text, roles.ButtonText, roles.WindowText):
+        palette.setColor(QPalette.ColorGroup.Disabled, role, QColor("#4E5A69"))
+    application.setPalette(palette)
+    # Segoe UI on Windows, SF Pro on macOS: whatever the platform's UI font is.
+    font = QFontDatabase.systemFont(QFontDatabase.SystemFont.GeneralFont)
+    font.setPixelSize(14)
+    application.setFont(font)
+
+
 def main():
     application = QApplication(sys.argv)
-    # Segoe UI on Windows, SF Pro on macOS: whatever the platform's UI font is.
-    application.setFont(QFontDatabase.systemFont(QFontDatabase.SystemFont.GeneralFont))
+    application.setApplicationName("Vertebrate")
+    apply_dark_theme(application)
     window = MainWindow()
     window.show()
     return application.exec()

@@ -17,9 +17,11 @@ A focused webcam application that turns human pose geometry into visible fall-po
 
 ## One file. Two threads. A live view.
 
-`app.py` provides a dark desktop interface, green/red skeleton overlays,
-Start/Stop controls, a live location/time watermark from the OS location
-service, and a flashing **FALL DETECTED** banner. Inference runs
+`app.py` provides a dark control-room interface: green/red skeleton overlays
+on a live view, a status sidebar (fall-evidence meter, people in view, frame
+rate, falls today, location, alarm setting), a live location/time watermark,
+and banners that escalate from **Fall detected** to a pulsing **Emergency
+alarm**. It looks the same on Windows and macOS. Inference runs
 locally on the CPU. The application does not upload or record webcam footage.
 
 ```mermaid
@@ -85,7 +87,7 @@ automatically. Prepare dependencies and weights before offline use.
 .venv/bin/python app.py                # macOS
 ```
 
-Click **Start camera**. Click **Stop** to release it. If camera 0 cannot open,
+Click **Start monitoring**. Click **Stop** to release it. If camera 0 cannot open,
 close other camera applications and allow camera access (Windows: *Settings >
 Privacy & security > Camera*; macOS: *System Settings > Privacy & Security >
 Camera* for your terminal or editor). A stalled driver is reported while the
@@ -111,7 +113,7 @@ Numbers. No images or video are saved.
 
 ### Emergency alarm
 
-Set **Alarm if fallen for** (bottom bar) to the number of seconds a person may
+In the sidebar's **Emergency alarm** card, set **Ring if fallen for** to the number of seconds a person may
 stay fallen before a loud siren rings on this device; choose **Off** (0) to
 disable it. The setting is remembered. While a fall is detected the banner
 counts down; when the alarm rings, the window comes to the front and a
