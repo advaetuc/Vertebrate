@@ -18,7 +18,8 @@ A focused webcam application that turns human pose geometry into visible fall-po
 ## One file. Two threads. A live view.
 
 `app.py` provides a dark desktop interface, green/red skeleton overlays,
-Start/Stop controls, and a flashing **FALL DETECTED** banner. Inference runs
+Start/Stop controls, a live location/time watermark from the OS location
+service, and a flashing **FALL DETECTED** banner. Inference runs
 locally on the CPU. The application does not upload or record webcam footage.
 
 ```mermaid
@@ -53,14 +54,22 @@ matching person. A nonmatching frame clears the counter. This scene-wide
 debounce does not establish person identity or a fixed duration in seconds.
 There are no historical baselines, ByteTrack IDs, or legacy state machines.
 
-## Quickstart · Windows 11 x64
+## Quickstart · Windows 11 x64 or macOS
 
 Use **Python 3.12** and a webcam. From the repository directory:
 
 ```powershell
+# Windows
 py -3.12 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
 .\.venv\Scripts\python.exe -m pip check
+```
+
+```bash
+# macOS
+python3.12 -m venv .venv
+.venv/bin/python -m pip install -r requirements_macOS.txt
+.venv/bin/python -m pip check
 ```
 
 Keep an existing working `.venv` if you already have one. Install only the listed
@@ -72,12 +81,33 @@ once and save them in either location. Missing weights are never downloaded
 automatically. Prepare dependencies and weights before offline use.
 
 ```powershell
-.\.venv\Scripts\python.exe app.py
+.\.venv\Scripts\python.exe app.py      # Windows
+.venv/bin/python app.py                # macOS
 ```
 
 Click **Start camera**. Click **Stop** to release it. If camera 0 cannot open,
-close other camera applications and enable Windows desktop-app camera access.
-A stalled driver is reported while the window remains responsive.
+close other camera applications and allow camera access (Windows: *Settings >
+Privacy & security > Camera*; macOS: *System Settings > Privacy & Security >
+Camera* for your terminal or editor). A stalled driver is reported while the
+window remains responsive.
+
+### Location watermark
+
+The video shows coordinates, accuracy, date/time and the source. A connected
+GPS receiver (USB, serial or Bluetooth, NMEA output) is used first; otherwise
+the OS location service, which uses the device's GPS chip if it has one and
+Wi-Fi positioning if not. Allow location access when asked. To pick a receiver
+manually set `VERTEBRATE_GPS_PORT` (e.g. `COM4` or `/dev/cu.usbmodem1101`), or
+set it to `off` to ignore receivers.
+
+### Fall log
+
+Every confirmed alert is logged with the date and time it was detected, when
+it ended, how long it lasted, the location, and why it ended (posture cleared,
+camera stopped, error, app closed). Click **Fall log** to see this device's
+history; a fall happening now appears live at the top. Each computer keeps its
+own file, `runtime/logs/falls/<device-name>.csv`, which opens in Excel or
+Numbers. No images or video are saved.
 
 ## Workspace after cleanup
 
