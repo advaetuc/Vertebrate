@@ -42,20 +42,12 @@ non-finite, or has non-positive Y, the spine predicate is disabled for that
 person; the box predicate still applies. The app uses Ultralytics keypoint
 coordinates and does not apply a separate keypoint-confidence cutoff.
 
-Confirmation is **per person**. `PersonTracker` (pure NumPy, no tracking
-package) links each detection to a person ID across frames: greedy matching by
-box IoU ≥ `0.2`, or, because a falling person's box changes shape, a centre
-shift ≤ `0.35` of the larger box diagonal (best IoU first, then nearest
-centre). Each person has their own streak: a processed frame where that person
-matches adds one (capped at five); a frame where they are detected and do not
-match resets it to zero. A frame where they are not detected leaves the streak
-unchanged; after `TRACK_MAX_MISSES` = 15 missed frames the ID is dropped, and a
-returning person gets a new ID. A person is **confirmed** at five consecutive
-fallen frames and stays confirmed through up to `ALERT_HOLD_MISSES` = 3 missed
-frames. The alert is on while at least one person is confirmed, so fallen
-frames from different people never add up. Five frames are not a fixed
-duration because model and camera rates vary. IDs restart with each camera
-session and identify a track, not who the person is.
+A frame is positive if any detected person matches. Five consecutive positive
+**processed inference frames** turn on the alert. A processed negative frame
+resets the count. Five frames are not a fixed duration because model and camera
+rates vary. Debounce is scene-wide, so successive frames may be positive for
+different people. There is no identity association; do not call this per-person
+temporal confirmation.
 
 This detects posture, not fall causality. Intentional lying down, rotated or
 overhead cameras, occlusion, proportions, and pose errors can affect it. A
@@ -70,9 +62,9 @@ no external emergency dispatch.”**
 
 A local desktop monolith with an event-driven Qt thread boundary. One `QThread`
 owns the OpenCV camera, YOLO model, inference, geometry, annotation, and
-per-person tracking. The Qt main thread owns `QMainWindow` and all widgets. The worker emits
-a detached `QImage`, the alert state, the leading person's streak and ID, the
-number of people detected and the confirmed person IDs by Qt signal; queued delivery runs
+debounce. The Qt main thread owns `QMainWindow` and all widgets. The worker emits
+a detached `QImage`, the boolean alert state, the debounce count and the
+number of people detected by Qt signal; queued delivery runs
 the receiving slot on the main thread. There is no database, authentication,
 microservice, or cloud-processing tier.
 
@@ -80,8 +72,8 @@ microservice, or cloud-processing tier.
 |---|---|---|
 | Geometry | `fallen_geometry()` | None; frame-local |
 | Annotation | `annotate()` | Current mutable frame only |
-| Per-person tracking | `PersonTracker`, `Track`, `box_iou()`, `center_shift()` | IDs, per-person streaks, worker-owned |
-| Camera/inference | `CameraThread.run()` | Capture, model, tracker, pending-frame event |
+| Debounce | `Debounce` | Positive-frame count, worker-owned |
+| Camera/inference | `CameraThread.run()` | Capture, model, debounce, pending-frame event |
 | Desktop UI | `MainWindow`, `VideoView`, `EvidenceMeter`, `StatTile` | UI state, timers, worker lifecycle |
 
 The model and camera are constructed in `CameraThread.run()`. The camera is
@@ -122,7 +114,7 @@ log CSV (see "Fall log" below).
 |---|---|---|
 | Webcam frame | Worker memory | BGR NumPy array, annotated in place |
 | Model result | One inference iteration | Boxes and `keypoints.xy` only |
-| Person tracks | Worker session | ID, last box, streak (cap 5), missed frames; dropped after 15 misses |
+| Debounce count | Worker session | Integer capped at five; reset by negative |
 | Display image | One pending signal | RGB QImage detached with `copy()` |
 | Display pixmap | Main window memory | Replaced on delivery and scaled on resize |
 | Model weights | Local filesystem | Root checked first, then `models/` |
@@ -134,16 +126,15 @@ log CSV (see "Fall log" below).
 
 ### Fall log
 
-`FallLog` (GUI thread, fed from `MainWindow.show_frame()`) turns the per-person
-confirmed alert into events. An event **starts** when the alert turns on (i.e. after the
-five-frame per-person check, so slightly after the posture began) and **ends** when the
+`FallLog` (GUI thread, fed from `MainWindow.show_frame()`) turns the debounced
+alert into events. An event **starts** when the alert turns on (i.e. after the
+five-frame debounce, so slightly after the posture began) and **ends** when the
 alert has stayed off for `END_GRACE_S` = 2 s; the end time is when it first
 went off, so short flickers do not split one fall. Stopping the camera, a worker
 error, or closing the app ends an ongoing event with that reason. Each finished
 event appends one CSV row: `device, fall_detected_at, ended_at, utc_offset,
 duration, duration_seconds, latitude, longitude, accuracy_m, location_source,
-ended_by, alarm_after_seconds, alarm_rang_at, alarm_silenced_at, person_ids`
-(the IDs confirmed during the event, `;`-separated, per camera session). Logs written
+ended_by, alarm_after_seconds, alarm_rang_at, alarm_silenced_at`. Logs written
 by an older version are rewritten once with the new columns (rows kept,
 new cells empty). Location is the `LocationFeed` fix at the start (or the first fix
 during the event). The device name is the host name (`QSysInfo`), and each
@@ -168,8 +159,8 @@ platform UI font, with the fixed-width system font for numbers.
   placeholder with a camera glyph when off), and Start monitoring / Stop /
   Fall log buttons.
 - **Sidebar (scrolls on small windows):** Status card (tinted by state), Fall
-  evidence meter (the leading person's five-frame streak and ID, sent by the
-  worker; each box on the video is labelled with its person ID), Live stats (people in view, frames per second, falls
+  evidence meter (the five-frame debounce, sent by the worker and no longer
+  drawn on the frame), Live stats (people in view, frames per second, falls
   today, alarm countdown), Location, and the Emergency alarm setting.
 
 `MainWindow.set_state()` drives everything from one state: idle, starting,
@@ -182,7 +173,7 @@ The **Ring if fallen for** stepper (sidebar "Emergency alarm" card) (0–600 s, 
 with `QSettings` per user and device. `MainWindow.check_alarm()` runs every
 250 ms while the camera is on and on each displayed frame: when the ongoing
 `FallLog` event has lasted the chosen delay (counted from the fall alert, so
-after the five-frame per-person check), `AlarmSound` loops a two-tone siren on this
+after the five-frame debounce), `AlarmSound` loops a two-tone siren on this
 device's speakers, the window comes to the front, the banner shows
 "EMERGENCY ALARM · fallen for …", and a **Silence alarm** button appears.
 Before that, the banner counts down "alarm in N s". The alarm rings at most
@@ -211,7 +202,7 @@ Never claim launch-time integrity checking.
 5. Each camera frame runs YOLO on CPU. `fallen_geometry()` evaluates the two
    predicates for each person. `annotate()` draws box and visible skeleton red
    for matches and green otherwise.
-6. The tracker updates once per processed frame. The annotated BGR frame becomes
+6. Debounce updates once per processed frame. The annotated BGR frame becomes
    RGB; a detached QImage and current boolean are emitted only if no previous
    display frame is pending. Inference continues when display frames are skipped.
 7. `MainWindow.show_frame()` receives the queued signal, updates/scales a pixmap
@@ -316,7 +307,7 @@ any future use.
 ### Component and code conventions
 
 `app.py` keeps the demo compact. `fallen_geometry()` and `annotate()` are
-standalone functions; `PersonTracker` owns IDs and streaks; `CameraThread` owns blocking
+standalone functions; `Debounce` owns its counter; `CameraThread` owns blocking
 I/O and inference; `MainWindow` owns visible state. Preserve that boundary.
 Extract modules only when they create a clear interface and retain a simple
 `python app.py` launch.
@@ -372,13 +363,13 @@ class CameraThread(QThread):
     # After inference and BGR -> RGB conversion:
     image = QImage(rgb.data, width, height, rgb.strides[0],
                    QImage.Format.Format_RGB888).copy()
-    self.frame_ready.emit(image, is_fallen, evidence, leader_id, people, confirmed)
+    self.frame_ready.emit(image, is_fallen, debounce.count, people)
 
 worker.frame_ready.connect(window.show_frame, Qt.ConnectionType.QueuedConnection)
 ~~~
 
-Display backpressure must not skip inference or change tracking. Create a new
-`PersonTracker` per worker session. Emit readable errors and release owned resources in
+Display backpressure must not skip inference or change debounce. Reset debounce
+per worker session. Emit readable errors and release owned resources in
 `finally`.
 
 ### Error handling and logging
@@ -425,7 +416,7 @@ wheelhouse.
 ### Testing protocol
 
 There is no active `tests/` directory; old tests are inside the archive and do
-not verify `app.py`. For app changes, add focused geometry/tracker tests and
+not verify `app.py`. For app changes, add focused geometry/debounce tests and
 offscreen Qt lifecycle tests where relevant. Mock the camera/model for
 repeatable automated tests, then separately test a real webcam on target hardware.
 
@@ -455,10 +446,9 @@ safety/accuracy claim.
    user data before moving or deleting anything.
 2. Treat `app.py` as active. Do not revive archived imports, ByteTrack, schemas,
    storage, manifests, or old Qt workers without an explicit request.
-3. Preserve exact predicates and per-person confirmation: ratio `>1.2`, spine
-   `shoulders_y > hips_y + 20`, five consecutive processed positives of the
-   SAME tracked person, reset on that person's processed negative, streak kept
-   on a missed detection. If user requests changed behavior, update this file
+3. Preserve exact predicates/debounce: ratio `>1.2`, spine
+   `shoulders_y > hips_y + 20`, five consecutive processed positives, reset on
+   a processed negative. If user requests changed behavior, update this file
    with code and document the semantics.
 4. Preserve thread ownership. Never update widgets from `CameraThread`, share a
    NumPy-backed live QImage, create/release the camera on the GUI thread, or
@@ -485,7 +475,7 @@ safety/accuracy claim.
 ### Definition of Done
 
 - [ ] Change targets standalone app and does not depend on archived modules.
-- [ ] Geometry, invalid joints, per-person tracking, and alert semantics match request and
+- [ ] Geometry, invalid joints, debounce, and alert semantics match request and
       have focused tests where applicable.
 - [ ] Model/OpenCV work stays in worker; GUI updates are queued; frame data is
       detached and bounded.
@@ -507,9 +497,7 @@ safety/accuracy claim.
 
 - Geometry detects posture and may classify ordinary lying down as fall-like.
 - Fixed 20-pixel margin changes meaning with image scale and subject distance.
-- Tracking is frame-to-frame box matching only (no appearance model): two
-  people who overlap heavily or cross can swap IDs, and someone hidden for
-  more than 15 frames returns with a new ID.
+- Scene-wide debounce can combine detections from different people.
 - Spine geometry has no explicit keypoint-confidence cutoff.
 - No tracking, video input, camera selector, recording, benchmark CLI, or
   release evaluation is active. The fall log records alert times, not footage.
