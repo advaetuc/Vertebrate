@@ -3,8 +3,9 @@ r"""Standalone webcam pose demo for Windows and macOS.
 Run:  Windows  .venv\Scripts\python.exe app.py
       macOS    .venv/bin/python app.py
 
-No VERTEBRATE imports, tracker, baseline, or configuration schema. Geometry is
-per-frame; the only detection history is a five-frame, scene-wide debounce.
+No VERTEBRATE imports, baseline, or configuration schema. Geometry is per-frame;
+a small built-in tracker follows each person so a fall is confirmed only when the
+SAME person shows the fallen posture in five consecutive processed frames.
 Uses existing local YOLO weights; does not download weights or upload footage.
 The live view carries a location/time watermark: a serial GPS receiver is used
 when one is found, otherwise the operating system's location service (its own
@@ -80,12 +81,12 @@ SYSTEM_SOURCE = "winrt" if IS_WINDOWS else "corelocation" if IS_MACOS else ""
 # Fall log ------------------------------------------------------------------
 FALL_LOG_DIR = Path(__file__).resolve().parent / "runtime" / "logs" / "falls"  # Git-ignored
 # A fall event ends only after the alert has been off this long, so a one-frame
-# flicker in the debounce does not split one fall into several log rows.
+# flicker in the per-person check does not split one fall into several log rows.
 END_GRACE_S = 2.0
 LOG_FIELDS = (
     "device", "fall_detected_at", "ended_at", "utc_offset", "duration", "duration_seconds",
     "latitude", "longitude", "accuracy_m", "location_source", "ended_by",
-    "alarm_after_seconds", "alarm_rang_at", "alarm_silenced_at",
+    "alarm_after_seconds", "alarm_rang_at", "alarm_silenced_at", "person_ids",
 )
 
 # Emergency alarm -----------------------------------------------------------
@@ -123,32 +124,128 @@ def fallen_geometry(box, keypoints):
     return bool(wide or inverted)
 
 
-class Debounce:
+# Per-person tracking -------------------------------------------------------
+# Detections are linked to people from frame to frame so a fall is confirmed for
+# ONE person (five consecutive fallen frames of that person), not for the scene.
+TRACK_MIN_IOU = 0.2           # box overlap that links a detection to a known person
+TRACK_MAX_CENTER_SHIFT = 0.35  # or: centre moved less than this share of the box diagonal
+                               # (a falling person's box changes shape, so overlap alone is weak)
+TRACK_MAX_MISSES = 15         # frames a person may go undetected before their ID is dropped
+ALERT_HOLD_MISSES = 3         # a confirmed person stays confirmed through this many missed frames
+
+
+def box_iou(a, b) -> float:
+    """Intersection over union of two xyxy boxes."""
+    ix1, iy1 = max(a[0], b[0]), max(a[1], b[1])
+    ix2, iy2 = min(a[2], b[2]), min(a[3], b[3])
+    inter = max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1)
+    union = (a[2] - a[0]) * (a[3] - a[1]) + (b[2] - b[0]) * (b[3] - b[1]) - inter
+    return float(inter / union) if union > 0 else 0.0
+
+
+def center_shift(a, b) -> float:
+    """Distance between box centres, as a share of the larger box diagonal."""
+    ax, ay = (a[0] + a[2]) / 2, (a[1] + a[3]) / 2
+    bx, by = (b[0] + b[2]) / 2, (b[1] + b[3]) / 2
+    diagonal = max(np.hypot(a[2] - a[0], a[3] - a[1]), np.hypot(b[2] - b[0], b[3] - b[1]))
+    return float(np.hypot(ax - bx, ay - by) / diagonal) if diagonal > 0 else 1.0
+
+
+class Track:
+    """One person followed across frames, with their own fallen-frame streak."""
+    __slots__ = ("id", "box", "streak", "misses")
+
+    def __init__(self, track_id: int, box):
+        self.id = track_id
+        self.box = tuple(map(float, box))
+        self.streak = 0   # consecutive fallen frames of THIS person, capped at CONSECUTIVE_FRAMES
+        self.misses = 0   # consecutive frames this person was not detected
+
+    @property
+    def confirmed(self) -> bool:
+        return self.streak >= CONSECUTIVE_FRAMES and self.misses <= ALERT_HOLD_MISSES
+
+
+class PersonTracker:
+    """Lightweight per-person tracker in pure NumPy (no extra packages, same on
+    Windows and macOS). Worker thread only; one instance per camera session.
+
+    Each frame, detections are matched greedily to known people by box overlap
+    (IoU), falling back to centre distance when a fall changes the box shape.
+    A matched person's streak grows on a fallen frame and resets on a normal
+    one. A frame where a person is not detected is not evidence either way, so
+    their streak is kept; after TRACK_MAX_MISSES missed frames the ID is dropped.
+    """
+
     def __init__(self):
-        self.count = 0
+        self.tracks: list[Track] = []
+        self._next_id = 1
 
-    def update(self, any_fallen):
-        self.count = min(self.count + 1, CONSECUTIVE_FRAMES) if any_fallen else 0
-        return self.count >= CONSECUTIVE_FRAMES
+    def update(self, boxes, fallen) -> list[Track]:
+        """Match this frame's detections; return the Track for each detection."""
+        boxes = [tuple(map(float, box)) for box in boxes]
+        candidates = []
+        for ti, track in enumerate(self.tracks):
+            for di, box in enumerate(boxes):
+                iou = box_iou(track.box, box)
+                shift = center_shift(track.box, box)
+                if iou >= TRACK_MIN_IOU or shift <= TRACK_MAX_CENTER_SHIFT:
+                    candidates.append((-iou, shift, ti, di))
+        candidates.sort()  # best overlap first, then nearest centre
+        assigned: list[Track | None] = [None] * len(boxes)
+        used_tracks = set()
+        for _neg_iou, _shift, ti, di in candidates:
+            if ti in used_tracks or assigned[di] is not None:
+                continue
+            used_tracks.add(ti)
+            assigned[di] = self.tracks[ti]
+        for di, box in enumerate(boxes):
+            track = assigned[di]
+            if track is None:
+                track = Track(self._next_id, box)
+                self._next_id += 1
+                self.tracks.append(track)
+                assigned[di] = track
+            track.box = box
+            track.misses = 0
+            track.streak = min(track.streak + 1, CONSECUTIVE_FRAMES) if fallen[di] else 0
+        seen = {id(track) for track in assigned}
+        for track in self.tracks:
+            if id(track) not in seen:
+                track.misses += 1
+        self.tracks = [track for track in self.tracks if track.misses <= TRACK_MAX_MISSES]
+        return assigned
+
+    def confirmed_ids(self) -> list[int]:
+        return sorted(track.id for track in self.tracks if track.confirmed)
+
+    def leader(self) -> Track | None:
+        """The person closest to a confirmed fall (highest streak, recently seen)."""
+        present = [t for t in self.tracks if t.misses <= ALERT_HOLD_MISSES and t.streak > 0]
+        return max(present, key=lambda t: (t.streak, -t.id)) if present else None
 
 
-def annotate(frame, result):
-    """Paint this result onto its own frame.
-    Returns (whether any person matches, number of people detected)."""
-    if result.boxes is None:
-        return False, 0
-    boxes = result.boxes.xyxy.cpu().numpy()
+def annotate(frame, result, tracker: PersonTracker):
+    """Paint this result onto its own frame and update per-person confirmation.
+    Returns (confirmed person IDs, leading person's streak, leading person's ID
+    or 0, number of people detected)."""
+    boxes = result.boxes.xyxy.cpu().numpy() if result.boxes is not None else np.empty((0, 4))
     points = result.keypoints.xy.cpu().numpy() if result.keypoints is not None else None
-    any_fallen = False
-    for i, box in enumerate(boxes):
-        joints = points[i] if points is not None and i < len(points) else None
-        fallen = fallen_geometry(box, joints)
-        any_fallen |= fallen
-        color = RED if fallen else GREEN
+    joints_list = [points[i] if points is not None and i < len(points) else None for i in range(len(boxes))]
+    fallen = [fallen_geometry(box, joints) for box, joints in zip(boxes, joints_list)]
+    tracks = tracker.update(boxes, fallen)
+    for box, joints, is_fallen, track in zip(boxes, joints_list, fallen, tracks):
+        color = RED if is_fallen else GREEN
+        thickness = 4 if track.confirmed else 2
         x1, y1, x2, y2 = map(int, box)
-        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-        cv2.putText(frame, "Fallen posture" if fallen else "Standing", (x1, max(22, y1 - 8)),
-                    cv2.FONT_HERSHEY_SIMPLEX, .6, color, 2, cv2.LINE_AA)
+        cv2.rectangle(frame, (x1, y1), (x2, y2), color, thickness)
+        if track.confirmed:
+            text = f"#{track.id} FALL CONFIRMED"
+        elif is_fallen:
+            text = f"#{track.id} Fallen posture {track.streak}/{CONSECUTIVE_FRAMES}"
+        else:
+            text = f"#{track.id} Standing"
+        cv2.putText(frame, text, (x1, max(22, y1 - 8)), cv2.FONT_HERSHEY_SIMPLEX, .6, color, 2, cv2.LINE_AA)
         if joints is None:
             continue
         visible = np.isfinite(joints).all(axis=1) & (joints[:, 0] > 0) & (joints[:, 1] > 0)
@@ -157,7 +254,8 @@ def annotate(frame, result):
                 cv2.line(frame, tuple(map(int, joints[a])), tuple(map(int, joints[b])), color, 2, cv2.LINE_AA)
         for point in joints[visible]:
             cv2.circle(frame, tuple(map(int, point)), 3, color, -1, cv2.LINE_AA)
-    return bool(any_fallen), len(boxes)
+    leader = tracker.leader()
+    return tracker.confirmed_ids(), (leader.streak if leader else 0), (leader.id if leader else 0), len(boxes)
 
 
 def local_weights():
@@ -180,8 +278,9 @@ def open_camera(index: int = 0):
 
 
 class CameraThread(QThread):
-    # Annotated frame, debounced alert, debounce count (0..5), people detected.
-    frame_ready = Signal(QImage, bool, int, int)
+    # Annotated frame, alert (any person confirmed), leading person's streak (0..5),
+    # leading person's ID (0 = none), people detected, IDs of confirmed people.
+    frame_ready = Signal(QImage, bool, int, int, int, list)
     error = Signal(str)
 
     def __init__(self, parent=None):
@@ -205,7 +304,7 @@ class CameraThread(QThread):
             if self.isInterruptionRequested():
                 return
             capture = open_camera(0)
-            debounce = Debounce()
+            tracker = PersonTracker()  # fresh IDs and streaks for each camera session
             while not self.isInterruptionRequested():
                 ok, frame = capture.read()
                 if not ok or frame is None:
@@ -213,17 +312,17 @@ class CameraThread(QThread):
                 if self.isInterruptionRequested():
                     break
                 result = model.predict(frame, device="cpu", verbose=False)[0]
-                matched, people = annotate(frame, result)
-                is_fallen = debounce.update(matched)
+                confirmed, evidence, leader_id, people = annotate(frame, result, tracker)
+                is_fallen = bool(confirmed)
                 # The evidence count is shown by the sidebar meter, not drawn on the frame.
                 # At most ONE queued frame signal: a slow GUI cannot accumulate
-                # large image buffers. Inference/debounce still see every frame.
+                # large image buffers. Inference/tracking still see every frame.
                 if not self._frame_pending.is_set() and not self.isInterruptionRequested():
                     rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                     h, w = rgb.shape[:2]
                     image = QImage(rgb.data, w, h, rgb.strides[0], QImage.Format.Format_RGB888).copy()
                     self._frame_pending.set()
-                    self.frame_ready.emit(image, is_fallen, debounce.count, people)
+                    self.frame_ready.emit(image, is_fallen, evidence, leader_id, people, confirmed)
         except Exception as exc:
             if not self.isInterruptionRequested():
                 self.error.emit(f"{type(exc).__name__}: {exc}")
@@ -455,9 +554,10 @@ def format_duration(seconds: float) -> str:
 class FallLog:
     """Per-device CSV of confirmed fall alerts. GUI thread only.
 
-    An event starts when the debounced alert turns on and ends when the alert
-    has stayed off for END_GRACE_S (end time = when it first went off), or when
-    the camera stops. One row is appended per finished event. The file lives in
+    An event starts when any person's fall is confirmed (five consecutive fallen
+    frames of that one person) and ends when no one has been confirmed for
+    END_GRACE_S (end time = when it first went off), or when the camera stops.
+    person_ids lists who was confirmed; IDs restart with each camera session. One row is appended per finished event. The file lives in
     runtime/logs/falls/<device>.csv and opens directly in Excel or Numbers.
     """
 
@@ -469,15 +569,17 @@ class FallLog:
         self._clear_since = None  # when the alert of the ongoing event last went off
         self.last_error = None
 
-    def update(self, is_fallen: bool, location) -> bool:
-        """Feed the alert state of each displayed frame. True if the log changed."""
+    def update(self, is_fallen: bool, location, person_ids=()) -> bool:
+        """Feed the alert state of each displayed frame, with the IDs of the people
+        whose fall is confirmed. True if the log changed."""
         now = datetime.now().astimezone()
         if is_fallen:
             self._clear_since = None
             if self.current is None:
-                self.current = {"start": now, "location": location,
+                self.current = {"start": now, "location": location, "people": set(person_ids),
                                 "alarm_after": None, "alarm_rang": None, "alarm_silenced": None}
                 return True
+            self.current["people"].update(person_ids)  # someone else may fall during the event
             if self.current["location"] is None and location is not None:
                 self.current["location"] = location  # first fix arrived mid-event
             return False
@@ -534,6 +636,7 @@ class FallLog:
             "alarm_after_seconds": event["alarm_after"] if event["alarm_after"] is not None else "",
             "alarm_rang_at": stamp(event["alarm_rang"]),
             "alarm_silenced_at": stamp(event["alarm_silenced"]),
+            "person_ids": ";".join(str(i) for i in sorted(event["people"])),
         }
         try:
             FALL_LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -579,8 +682,9 @@ class FallLog:
 
 class FallLogDialog(QDialog):
     """Window listing this device's fall events; an ongoing fall is shown live on top."""
-    COLUMNS = ("Fall detected at", "Ended at", "Duration", "Alarm", "Location", "Location source", "Ended by")
-    LOCATION_COLUMN = 4
+    COLUMNS = ("Fall detected at", "Ended at", "Duration", "Person", "Alarm", "Location", "Location source",
+               "Ended by")
+    LOCATION_COLUMN = 5
 
     def __init__(self, log: FallLog, parent=None):
         super().__init__(parent)
@@ -654,6 +758,7 @@ class FallLogDialog(QDialog):
                 "ended_by": "—",
                 "alarm_rang_at": stamp(current["alarm_rang"]),
                 "alarm_silenced_at": stamp(current["alarm_silenced"]),
+                "person_ids": ";".join(str(i) for i in sorted(current["people"])),
             }, True))
         entries += [(row, False) for row in rows]
         self.table.setRowCount(len(entries))
@@ -669,8 +774,10 @@ class FallLogDialog(QDialog):
                 alarm = f"Rang {row['alarm_rang_at'][-8:]}"  # time part; date is in the first column
                 if row.get("alarm_silenced_at"):
                     alarm += f", silenced {row['alarm_silenced_at'][-8:]}"
+            ids = [i for i in (row.get("person_ids") or "").split(";") if i]
+            person = ", ".join(f"#{i}" for i in ids) if ids else "—"  # older rows have no IDs
             values = (row.get("fall_detected_at", ""), row.get("ended_at", ""), row.get("duration", ""),
-                      alarm, location, row.get("location_source", ""), row.get("ended_by", ""))
+                      person, alarm, location, row.get("location_source", ""), row.get("ended_by", ""))
             for c, value in enumerate(values):
                 item = QTableWidgetItem(value)
                 if ongoing:
@@ -1046,6 +1153,17 @@ QHeaderView::section {{ background: #141B24; color: {MUTED}; border: none;
 """
 
 
+def people_text(ids) -> str:
+    """'Person #3', 'People #3 and #5', 'People #2, #3 and #5'."""
+    ids = sorted(ids)
+    if not ids:
+        return "Person"
+    tags = [f"#{i}" for i in ids]
+    if len(tags) == 1:
+        return f"Person {tags[0]}"
+    return "People " + ", ".join(tags[:-1]) + f" and {tags[-1]}"
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -1057,6 +1175,7 @@ class MainWindow(QMainWindow):
         self._state_detail = None
         self._flash = False
         self._people = 0
+        self._leader_id = 0  # person closest to a confirmed fall (0 = none)
         self._frame_times = deque(maxlen=30)
         self._falls_today = 0
         self.location = LocationFeed(self)
@@ -1237,7 +1356,7 @@ class MainWindow(QMainWindow):
         self.evidence_label = make_label(f"0 of {CONSECUTIVE_FRAMES} frames", 13, QFont.Weight.DemiBold, mono=True)
         row.addWidget(self.evidence_label)
         row.addStretch()
-        row.addWidget(make_label(f"Alert after {CONSECUTIVE_FRAMES} in a row", 12, obj="muted"))
+        row.addWidget(make_label(f"{CONSECUTIVE_FRAMES} in a row, same person", 12, obj="muted"))
         layout.addLayout(row)
         column.addWidget(card)
 
@@ -1311,17 +1430,22 @@ class MainWindow(QMainWindow):
             self._flash = False
         self.apply_state()
 
+    def _who(self) -> str:
+        current = self.fall_log.current
+        return people_text(current["people"]) if current is not None else "Person"
+
     def _fall_detail(self) -> str:
         current = self.fall_log.current
         fallen_for = format_duration(self.fall_log.ongoing_seconds())
         delay = self.alarm_delay.value()
         if current is None:
             return "Fall posture detected."
+        who = self._who()
         if delay == 0:
-            return f"Fallen for {fallen_for}. The alarm is off."
+            return f"{who} down for {fallen_for}. The alarm is off."
         if current["alarm_rang"] is None:
-            return f"Fallen for {fallen_for}. Alarm in {self._alarm_remaining()} s."
-        return f"Fallen for {fallen_for}. Alarm silenced."
+            return f"{who} down for {fallen_for}. Alarm in {self._alarm_remaining()} s."
+        return f"{who} down for {fallen_for}. Alarm silenced."
 
     def _alarm_remaining(self) -> int:
         return max(0, int(self.alarm_delay.value() - self.fall_log.ongoing_seconds() + 0.999))
@@ -1337,7 +1461,8 @@ class MainWindow(QMainWindow):
             "monitoring": ("All clear", self._monitoring_detail()),
             "fall": ("Fall detected", self._fall_detail()),
             "alarm": ("Emergency alarm",
-                      f"Fallen for {format_duration(self.fall_log.ongoing_seconds())}. Siren ringing on this device."),
+                      f"{self._who()} down for {format_duration(self.fall_log.ongoing_seconds())}. "
+                      "Siren ringing on this device."),
             "stopping": ("Stopping…", "Releasing the camera."),
             "error": ("Something went wrong", "Check the message below and try again."),
         }[state]
@@ -1364,14 +1489,15 @@ class MainWindow(QMainWindow):
         self.video.set_border(border[0], border[1], live)
 
         if state == "fall":
-            self.banner_title.setText("Fall detected")
+            self.banner_title.setText(f"Fall detected — {self._who().lower()}")
             self.banner_detail.setText(self._fall_detail())
             self.banner.setStyleSheet(
                 f"QFrame#banner {{ background: {rgba(WARN, .13)}; border: 1px solid {rgba(WARN, .55)};"
                 f" border-radius: 14px; }} QLabel {{ color: {TEXT}; }}")
             self.banner_icon.setStyleSheet(f"color: #1A0E06; background: {WARN}; border-radius: 18px;")
         elif state == "alarm":
-            self.banner_title.setText(f"EMERGENCY ALARM — fallen for {format_duration(self.fall_log.ongoing_seconds())}")
+            self.banner_title.setText(f"EMERGENCY ALARM — {self._who().lower()} down for "
+                                      f"{format_duration(self.fall_log.ongoing_seconds())}")
             self.banner_detail.setText("A siren is ringing on this device. Check on the person, then silence it.")
             self.banner.setStyleSheet(
                 f"QFrame#banner {{ background: {color}; border: 1px solid {rgba('#FFFFFF', .25)};"
@@ -1410,7 +1536,10 @@ class MainWindow(QMainWindow):
             self.stat_alarm.set(f"{self._alarm_remaining()} s", WARN)
         else:
             self.stat_alarm.set(f"{delay} s")
-        self.evidence_label.setText(f"{self.meter.value} of {CONSECUTIVE_FRAMES} frames")
+        if self._leader_id and self.meter.value:
+            self.evidence_label.setText(f"#{self._leader_id} · {self.meter.value} of {CONSECUTIVE_FRAMES}")
+        else:
+            self.evidence_label.setText(f"{self.meter.value} of {CONSECUTIVE_FRAMES} frames")
 
     def refresh_location(self) -> None:
         fix = self.location.current_fix()
@@ -1448,6 +1577,7 @@ class MainWindow(QMainWindow):
         self._stopping = False
         self._frame_times.clear()
         self._people = 0
+        self._leader_id = 0
         self.meter.set_value(0)
         self.start_button.setEnabled(False)
         self.stop_button.setEnabled(True)
@@ -1472,8 +1602,8 @@ class MainWindow(QMainWindow):
         self.set_state("stopping")
         self.stop_timer.start()
 
-    @Slot(QImage, bool, int, int)
-    def show_frame(self, image, is_fallen, evidence, people):
+    @Slot(QImage, bool, int, int, int, list)
+    def show_frame(self, image, is_fallen, evidence, leader_id, people, confirmed_ids):
         worker = self.sender()
         try:
             if worker is not self.worker or self._stopping:
@@ -1482,8 +1612,9 @@ class MainWindow(QMainWindow):
             self.video.set_frame(QPixmap.fromImage(image))
             self._frame_times.append(time.monotonic())
             self._people = people
+            self._leader_id = leader_id
             self.meter.set_value(evidence)
-            if self.fall_log.update(is_fallen, self.location.current_fix()):
+            if self.fall_log.update(is_fallen, self.location.current_fix(), confirmed_ids):
                 self.log_changed()
             self.check_alarm()
             # An ongoing fall event (including its 2 s grace) keeps the fall state,
@@ -1524,6 +1655,7 @@ class MainWindow(QMainWindow):
             worker.deleteLater()
         self._stopping = False
         self._people = 0
+        self._leader_id = 0
         self._frame_times.clear()
         self.meter.set_value(0)
         self.start_button.setEnabled(True)
