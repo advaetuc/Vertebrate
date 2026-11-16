@@ -35,7 +35,7 @@ locally on the CPU. The application does not upload or record webcam footage.
 ```mermaid
 flowchart LR
     A[Webcam 0] --> B[Background QThread]
-    B --> C[YOLO11 pose + geometry + debounce]
+    B --> C[YOLO11 pose + geometry + per-person tracking]
     C --> D[OpenCV overlays]
     D -->|Copied QImage + boolean via Qt signal| E[Main thread: PySide6 GUI]
     E -->|Start / cooperative Stop| B
@@ -59,10 +59,14 @@ Image Y increases downward. Missing/zeroed spine landmarks disable the spine
 check; the bounding-box check remains available. Red overlays indicate matching
 posture; green indicates the rule did not match.
 
-The alert requires **five consecutive processed frames** with at least one
-matching person. A nonmatching frame clears the counter. This scene-wide
-debounce does not establish person identity or a fixed duration in seconds.
-There are no historical baselines, ByteTrack IDs, or legacy state machines.
+A fall is confirmed **per person**: a small built-in tracker gives each person
+an ID (`#1`, `#2`, …) that follows them from frame to frame, and the alert needs
+**five consecutive processed frames in which that same person** matches. A
+normal frame for that person resets their count; fallen frames from different
+people never add up. Each box on the video shows its ID and progress, e.g.
+`#2 Fallen posture 3/5`, then `#2 FALL CONFIRMED`. The fall log records which
+person IDs fell (IDs restart when the camera restarts). Five frames are not a
+fixed duration in seconds. The tracker uses NumPy only — no extra packages.
 
 ## Quickstart · Windows 11 x64 or macOS
 
