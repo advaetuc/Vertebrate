@@ -15,14 +15,22 @@ A focused webcam application that turns human pose geometry into visible fall-po
 
 ---
 
-## One file. Two threads. A live view.
+## One entry point. Two threads. A live view.
 
-`app.py` provides a dark control-room interface: green/red skeleton overlays
+`app.py` starts the application; implementation is organized under `app_modules/` so each class and shared helper can be found directly. The runtime behavior and interface are unchanged. `app.py` provides a dark control-room interface: green/red skeleton overlays
 on a live view, a status sidebar (fall-evidence meter, people in view, frame
 rate, falls today, location, alarm setting), a live location/time watermark,
 and banners that escalate from **Fall detected** to a pulsing **Emergency
 alarm**. It looks the same on Windows and macOS. Inference runs
 locally on the CPU. The application does not upload or record webcam footage.
+
+### Code map
+
+- `app.py` — executable entry point.
+- `app_modules/mainwindow.py` — connects the interface, camera, location, fall log, and alarm.
+- `app_modules/camerathread.py`, `locationfeed.py`, `falllog.py`, and `alarmsound.py` — background camera, location, logging, and alarm components.
+- `app_modules/debounce.py`, `falllogdialog.py`, and the UI component modules (`videoview.py`, `evidencemeter.py`, `stattile.py`, `logomark.py`) — focused behavior and widgets.
+- `app_modules/common.py` — shared settings, constants, Qt imports, and helper functions.
 
 ```mermaid
 flowchart LR

@@ -1,4 +1,4 @@
-r"""Standalone webcam pose demo for Windows and macOS.
+"""Standalone webcam pose demo entry point.
 
 Run:  Windows  .venv\Scripts\python.exe app.py
       macOS    .venv/bin/python app.py
@@ -15,13 +15,6 @@ Confirmed fall alerts are logged per device to runtime/logs/falls/<device>.csv
 If a fall lasts longer than the user-set delay, a siren rings on this device
 until the person gets up or someone presses Silence.
 """
-from collections import deque
-from datetime import datetime
-from pathlib import Path
-import csv
-import os
-import platform
-import re
 import sys
 import threading
 import time
