@@ -4,8 +4,9 @@ r"""Standalone webcam pose demo for Windows and macOS.
 Run:  Windows  .venv\Scripts\python.exe app.py
       macOS    .venv/bin/python app.py
 
-No VERTEBRATE imports, tracker, baseline, or configuration schema. Geometry is
-per-frame; the only detection history is a five-frame, scene-wide debounce.
+No VERTEBRATE imports, baseline, or configuration schema. Geometry is per-frame;
+a small built-in tracker (tracking.py) follows each person so a fall is confirmed
+only when the SAME person shows the fallen posture in five consecutive frames.
 Uses existing local YOLO weights; does not download weights or upload footage.
 The live view carries a location/time watermark: a serial GPS receiver is used
 when one is found, otherwise the operating system's location service (its own
@@ -26,17 +27,27 @@ APP_DIR = Path(__file__).resolve().parent.parent
 
 import csv
 
+import json
+
 import os
 
 import platform
 
+import queue
+
 import re
+
+import ssl
 
 import sys
 
 import threading
 
 import time
+
+import urllib.error
+
+import urllib.request
 
 import wave
 
@@ -65,9 +76,9 @@ from PySide6.QtGui import (
 from PySide6.QtPositioning import QGeoPositionInfo, QGeoPositionInfoSource
 
 from PySide6.QtWidgets import (
-    QAbstractItemView, QApplication, QDialog, QFrame, QGridLayout, QHBoxLayout, QHeaderView, QLabel,
-    QMainWindow, QPushButton, QScrollArea, QSizePolicy, QSpinBox, QTableWidget, QTableWidgetItem,
-    QVBoxLayout, QWidget,
+    QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog, QFrame, QGridLayout, QHBoxLayout,
+    QHeaderView, QLabel, QLineEdit, QMainWindow, QPushButton, QScrollArea, QSizePolicy, QSpinBox,
+    QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
 try:  # Qt Multimedia plays the alarm; without it the app falls back to system beeps.
@@ -110,7 +121,7 @@ END_GRACE_S = 2.0
 LOG_FIELDS = (
     "device", "fall_detected_at", "ended_at", "utc_offset", "duration", "duration_seconds",
     "latitude", "longitude", "accuracy_m", "location_source", "ended_by",
-    "alarm_after_seconds", "alarm_rang_at", "alarm_silenced_at",
+    "alarm_after_seconds", "alarm_rang_at", "alarm_silenced_at", "person_ids",
 )
 
 ALARM_DEFAULT_S = 30
@@ -145,23 +156,28 @@ def fallen_geometry(box, keypoints):
             inverted = shoulder_y > hip_y + 20.0
     return bool(wide or inverted)
 
-def annotate(frame, result):
-    """Paint this result onto its own frame.
-    Returns (whether any person matches, number of people detected)."""
-    if result.boxes is None:
-        return False, 0
-    boxes = result.boxes.xyxy.cpu().numpy()
+def annotate(frame, result, tracker):
+    """Paint this result onto its own frame and update per-person confirmation.
+    `tracker` is a tracking.PersonTracker (worker thread only).
+    Returns (confirmed person IDs, leading person's streak, leading person's ID
+    or 0, number of people detected)."""
+    boxes = result.boxes.xyxy.cpu().numpy() if result.boxes is not None else np.empty((0, 4))
     points = result.keypoints.xy.cpu().numpy() if result.keypoints is not None else None
-    any_fallen = False
-    for i, box in enumerate(boxes):
-        joints = points[i] if points is not None and i < len(points) else None
-        fallen = fallen_geometry(box, joints)
-        any_fallen |= fallen
-        color = RED if fallen else GREEN
+    joints_list = [points[i] if points is not None and i < len(points) else None for i in range(len(boxes))]
+    fallen = [fallen_geometry(box, joints) for box, joints in zip(boxes, joints_list)]
+    tracks = tracker.update(boxes, fallen)
+    for box, joints, is_fallen, track in zip(boxes, joints_list, fallen, tracks):
+        color = RED if is_fallen else GREEN
+        thickness = 4 if track.confirmed else 2
         x1, y1, x2, y2 = map(int, box)
-        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-        cv2.putText(frame, "Fallen posture" if fallen else "Standing", (x1, max(22, y1 - 8)),
-                    cv2.FONT_HERSHEY_SIMPLEX, .6, color, 2, cv2.LINE_AA)
+        cv2.rectangle(frame, (x1, y1), (x2, y2), color, thickness)
+        if track.confirmed:
+            text = f"#{track.id} FALL CONFIRMED"
+        elif is_fallen:
+            text = f"#{track.id} Fallen posture {track.streak}/{CONSECUTIVE_FRAMES}"
+        else:
+            text = f"#{track.id} Standing"
+        cv2.putText(frame, text, (x1, max(22, y1 - 8)), cv2.FONT_HERSHEY_SIMPLEX, .6, color, 2, cv2.LINE_AA)
         if joints is None:
             continue
         visible = np.isfinite(joints).all(axis=1) & (joints[:, 0] > 0) & (joints[:, 1] > 0)
@@ -170,7 +186,8 @@ def annotate(frame, result):
                 cv2.line(frame, tuple(map(int, joints[a])), tuple(map(int, joints[b])), color, 2, cv2.LINE_AA)
         for point in joints[visible]:
             cv2.circle(frame, tuple(map(int, point)), 3, color, -1, cv2.LINE_AA)
-    return bool(any_fallen), len(boxes)
+    leader = tracker.leader()
+    return tracker.confirmed_ids(), (leader.streak if leader else 0), (leader.id if leader else 0), len(boxes)
 
 def local_weights():
     root = APP_DIR
@@ -238,6 +255,17 @@ def device_name() -> str:
     """Readable name of this computer, used to keep one fall log per device."""
     name = QSysInfo.machineHostName() or platform.node() or "this-device"
     return name.removesuffix(".local")
+
+def people_text(ids) -> str:
+    """'Person #3', 'People #3 and #5', 'People #2, #3 and #5'."""
+    ids = sorted(ids)
+    if not ids:
+        return "Person"
+    tags = [f"#{i}" for i in ids]
+    if len(tags) == 1:
+        return f"Person {tags[0]}"
+    return "People " + ", ".join(tags[:-1]) + f" and {tags[-1]}"
+
 
 def format_duration(seconds: float) -> str:
     seconds = max(0, int(round(seconds)))
@@ -372,6 +400,13 @@ QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0px; }}
 QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {{ background: none; }}
 
 QToolTip {{ color: {TEXT}; background: #18202B; border: 1px solid #2A3644; padding: 6px 8px; }}
+
+QLineEdit, QComboBox {{ color: {TEXT}; background: {SURFACE_2}; border: 1px solid #263140; border-radius: 9px;
+                       padding: 9px 12px; selection-background-color: #2B6F8F; }}
+QLineEdit:focus, QComboBox:focus {{ border-color: {ACCENT}; }}
+QComboBox QAbstractItemView {{ color: {TEXT}; background: #141B24; border: 1px solid #263140;
+                              selection-background-color: #1F3A4D; }}
+QCheckBox {{ color: {TEXT}; spacing: 10px; }}
 
 QTableWidget {{ color: {TEXT}; background: {SURFACE_2}; alternate-background-color: {SURFACE};
                gridline-color: #19212C; border: 1px solid {BORDER}; border-radius: 12px; }}

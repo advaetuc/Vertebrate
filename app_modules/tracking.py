@@ -1,0 +1,103 @@
+"""Per-person tracking: follows each detected person so a fall is confirmed
+for ONE person, not across the whole scene. Pure NumPy, same on Windows and macOS."""
+from .common import *  # shared Qt imports, constants, and helpers
+
+# Per-person tracking -------------------------------------------------------
+# Detections are linked to people from frame to frame so a fall is confirmed for
+# ONE person (five consecutive fallen frames of that person), not for the scene.
+TRACK_MIN_IOU = 0.2           # box overlap that links a detection to a known person
+TRACK_MAX_CENTER_SHIFT = 0.35  # or: centre moved less than this share of the box diagonal
+                               # (a falling person's box changes shape, so overlap alone is weak)
+TRACK_MAX_MISSES = 15         # frames a person may go undetected before their ID is dropped
+ALERT_HOLD_MISSES = 3         # a confirmed person stays confirmed through this many missed frames
+
+
+def box_iou(a, b) -> float:
+    """Intersection over union of two xyxy boxes."""
+    ix1, iy1 = max(a[0], b[0]), max(a[1], b[1])
+    ix2, iy2 = min(a[2], b[2]), min(a[3], b[3])
+    inter = max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1)
+    union = (a[2] - a[0]) * (a[3] - a[1]) + (b[2] - b[0]) * (b[3] - b[1]) - inter
+    return float(inter / union) if union > 0 else 0.0
+
+
+def center_shift(a, b) -> float:
+    """Distance between box centres, as a share of the larger box diagonal."""
+    ax, ay = (a[0] + a[2]) / 2, (a[1] + a[3]) / 2
+    bx, by = (b[0] + b[2]) / 2, (b[1] + b[3]) / 2
+    diagonal = max(np.hypot(a[2] - a[0], a[3] - a[1]), np.hypot(b[2] - b[0], b[3] - b[1]))
+    return float(np.hypot(ax - bx, ay - by) / diagonal) if diagonal > 0 else 1.0
+
+
+class Track:
+    """One person followed across frames, with their own fallen-frame streak."""
+    __slots__ = ("id", "box", "streak", "misses")
+
+    def __init__(self, track_id: int, box):
+        self.id = track_id
+        self.box = tuple(map(float, box))
+        self.streak = 0   # consecutive fallen frames of THIS person, capped at CONSECUTIVE_FRAMES
+        self.misses = 0   # consecutive frames this person was not detected
+
+    @property
+    def confirmed(self) -> bool:
+        return self.streak >= CONSECUTIVE_FRAMES and self.misses <= ALERT_HOLD_MISSES
+
+
+class PersonTracker:
+    """Lightweight per-person tracker in pure NumPy (no extra packages, same on
+    Windows and macOS). Worker thread only; one instance per camera session.
+
+    Each frame, detections are matched greedily to known people by box overlap
+    (IoU), falling back to centre distance when a fall changes the box shape.
+    A matched person's streak grows on a fallen frame and resets on a normal
+    one. A frame where a person is not detected is not evidence either way, so
+    their streak is kept; after TRACK_MAX_MISSES missed frames the ID is dropped.
+    """
+
+    def __init__(self):
+        self.tracks: list[Track] = []
+        self._next_id = 1
+
+    def update(self, boxes, fallen) -> list[Track]:
+        """Match this frame's detections; return the Track for each detection."""
+        boxes = [tuple(map(float, box)) for box in boxes]
+        candidates = []
+        for ti, track in enumerate(self.tracks):
+            for di, box in enumerate(boxes):
+                iou = box_iou(track.box, box)
+                shift = center_shift(track.box, box)
+                if iou >= TRACK_MIN_IOU or shift <= TRACK_MAX_CENTER_SHIFT:
+                    candidates.append((-iou, shift, ti, di))
+        candidates.sort()  # best overlap first, then nearest centre
+        assigned: list[Track | None] = [None] * len(boxes)
+        used_tracks = set()
+        for _neg_iou, _shift, ti, di in candidates:
+            if ti in used_tracks or assigned[di] is not None:
+                continue
+            used_tracks.add(ti)
+            assigned[di] = self.tracks[ti]
+        for di, box in enumerate(boxes):
+            track = assigned[di]
+            if track is None:
+                track = Track(self._next_id, box)
+                self._next_id += 1
+                self.tracks.append(track)
+                assigned[di] = track
+            track.box = box
+            track.misses = 0
+            track.streak = min(track.streak + 1, CONSECUTIVE_FRAMES) if fallen[di] else 0
+        seen = {id(track) for track in assigned}
+        for track in self.tracks:
+            if id(track) not in seen:
+                track.misses += 1
+        self.tracks = [track for track in self.tracks if track.misses <= TRACK_MAX_MISSES]
+        return assigned
+
+    def confirmed_ids(self) -> list[int]:
+        return sorted(track.id for track in self.tracks if track.confirmed)
+
+    def leader(self) -> Track | None:
+        """The person closest to a confirmed fall (highest streak, recently seen)."""
+        present = [t for t in self.tracks if t.misses <= ALERT_HOLD_MISSES and t.streak > 0]
+        return max(present, key=lambda t: (t.streak, -t.id)) if present else None

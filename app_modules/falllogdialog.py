@@ -4,8 +4,9 @@ from .falllog import FallLog
 
 class FallLogDialog(QDialog):
     """Window listing this device's fall events; an ongoing fall is shown live on top."""
-    COLUMNS = ("Fall detected at", "Ended at", "Duration", "Alarm", "Location", "Location source", "Ended by")
-    LOCATION_COLUMN = 4
+    COLUMNS = ("Fall detected at", "Ended at", "Duration", "Person", "Alarm", "Location", "Location source",
+               "Ended by")
+    LOCATION_COLUMN = 5
 
     def __init__(self, log: FallLog, parent=None):
         super().__init__(parent)
@@ -79,6 +80,7 @@ class FallLogDialog(QDialog):
                 "ended_by": "—",
                 "alarm_rang_at": stamp(current["alarm_rang"]),
                 "alarm_silenced_at": stamp(current["alarm_silenced"]),
+                "person_ids": ";".join(str(i) for i in sorted(current["people"])),
             }, True))
         entries += [(row, False) for row in rows]
         self.table.setRowCount(len(entries))
@@ -94,8 +96,10 @@ class FallLogDialog(QDialog):
                 alarm = f"Rang {row['alarm_rang_at'][-8:]}"  # time part; date is in the first column
                 if row.get("alarm_silenced_at"):
                     alarm += f", silenced {row['alarm_silenced_at'][-8:]}"
+            ids = [i for i in (row.get("person_ids") or "").split(";") if i]
+            person = ", ".join(f"#{i}" for i in ids) if ids else "—"  # older rows have no IDs
             values = (row.get("fall_detected_at", ""), row.get("ended_at", ""), row.get("duration", ""),
-                      alarm, location, row.get("location_source", ""), row.get("ended_by", ""))
+                      person, alarm, location, row.get("location_source", ""), row.get("ended_by", ""))
             for c, value in enumerate(values):
                 item = QTableWidgetItem(value)
                 if ongoing:

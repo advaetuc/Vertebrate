@@ -22,20 +22,23 @@ on a live view, a status sidebar (fall-evidence meter, people in view, frame
 rate, falls today, location, alarm setting), a live location/time watermark,
 and banners that escalate from **Fall detected** to a pulsing **Emergency
 alarm**. It looks the same on Windows and macOS. Inference runs
-locally on the CPU. The application does not upload or record webcam footage.
+locally on the CPU. The application does not upload or record webcam footage;
+the only optional network use is a text alert to caregivers on Discord.
 
 ### Code map
 
 - `app.py` — executable entry point.
 - `app_modules/mainwindow.py` — connects the interface, camera, location, fall log, and alarm.
 - `app_modules/camerathread.py`, `locationfeed.py`, `falllog.py`, and `alarmsound.py` — background camera, location, logging, and alarm components.
-- `app_modules/debounce.py`, `falllogdialog.py`, and the UI component modules (`videoview.py`, `evidencemeter.py`, `stattile.py`, `logomark.py`) — focused behavior and widgets.
+- `app_modules/caregivers.py` — optional Discord caregiver alerts: sender, message format and setup window.
+- `app_modules/tracking.py` — per-person tracking (`PersonTracker`): IDs and each person's 5-frame fall check.
+- `app_modules/falllogdialog.py` and the UI component modules (`videoview.py`, `evidencemeter.py`, `stattile.py`, `logomark.py`) — focused behavior and widgets.
 - `app_modules/common.py` — shared settings, constants, Qt imports, and helper functions.
 
 ```mermaid
 flowchart LR
     A[Webcam 0] --> B[Background QThread]
-    B --> C[YOLO11 pose + geometry + debounce]
+    B --> C[YOLO11 pose + geometry + per-person tracking]
     C --> D[OpenCV overlays]
     D -->|Copied QImage + boolean via Qt signal| E[Main thread: PySide6 GUI]
     E -->|Start / cooperative Stop| B
@@ -59,10 +62,14 @@ Image Y increases downward. Missing/zeroed spine landmarks disable the spine
 check; the bounding-box check remains available. Red overlays indicate matching
 posture; green indicates the rule did not match.
 
-The alert requires **five consecutive processed frames** with at least one
-matching person. A nonmatching frame clears the counter. This scene-wide
-debounce does not establish person identity or a fixed duration in seconds.
-There are no historical baselines, ByteTrack IDs, or legacy state machines.
+A fall is confirmed **per person**: a small built-in tracker gives each person
+an ID (`#1`, `#2`, …) that follows them from frame to frame, and the alert needs
+**five consecutive processed frames in which that same person** matches. A
+normal frame for that person resets their count; fallen frames from different
+people never add up. Each box on the video shows its ID and progress, e.g.
+`#2 Fallen posture 3/5`, then `#2 FALL CONFIRMED`. The fall log and the Discord
+alerts name the person (IDs restart when the camera restarts). Five frames are
+not a fixed duration in seconds. The tracker uses NumPy only — no extra packages.
 
 ## Quickstart · Windows 11 x64 or macOS
 
@@ -127,8 +134,40 @@ disable it. The setting is remembered. While a fall is detected the banner
 counts down; when the alarm rings, the window comes to the front and a
 **Silence alarm** button appears. The alarm stops on its own when the person
 gets up, and ring/silence times are added to the fall log. Keep the device's
-volume up: the app cannot override a muted speaker. The alarm sounds only on
-this device; nobody is contacted.
+volume up: the app cannot override a muted speaker. The siren sounds only on
+this device; to also reach people elsewhere, set up caregiver alerts.
+
+### Caregiver alerts (Discord)
+
+The app can post to a Discord channel when a fall is detected, when the alarm
+rings and when the fall ends. Each message names the person (`#2`), gives the time, how long they
+have been down and the location with a Google Maps link. No images or video are
+ever sent.
+
+1. In Discord, make a channel for the caregivers (or use an existing one).
+2. Choose how to connect:
+   - **Webhook (simplest):** channel ⚙ *Edit Channel › Integrations › Webhooks ›
+     New Webhook › Copy Webhook URL*.
+   - **Bot:** in the Discord Developer Portal create an application, add a bot,
+     copy its token, and invite it with *Send Messages* and *Embed Links*. Turn
+     on Developer Mode in Discord, right-click the channel › *Copy Channel ID*.
+3. In Vertebrate, open **Set up Discord…** in the sidebar's **Caregiver alerts**
+   card, tick **Send caregiver alerts**, paste the webhook URL (or token and
+   channel ID), optionally add a ping such as `@here` or `<@&role-id>`, choose
+   which events to send, press **Send test message**, then **Save**.
+
+**Fixed channel (current setup).** If `runtime/config/discord_webhook.txt`
+holds a webhook URL, alerts are always on and go to that channel for every
+event, with no ping; the sidebar button becomes **Send test message**. To
+change the channel, replace the URL in that file and restart the app; delete
+the file to go back to the in-app setup. `runtime/` is Git-ignored, so the URL
+is never pushed. Each alert's result is also printed in the terminal, e.g.
+`[caregivers] fall alert delivered`.
+
+The in-app settings are saved on this computer only, never in the project folder or
+Git. Keep the webhook URL and bot token private: anyone with them can post to
+the channel. Alerts need an internet connection; the local alarm and fall log
+work without one. No extra packages are needed on Windows or macOS.
 
 ## Workspace after cleanup
 

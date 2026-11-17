@@ -2,6 +2,9 @@
 from .common import *  # shared Qt imports, constants, and helpers
 from .alarmsound import AlarmSound
 from .camerathread import CameraThread
+from .caregivers import (
+    CaregiverDialog, DiscordNotifier, caregiver_config_problem, caregiver_embed,
+)
 from .evidencemeter import EvidenceMeter
 from .falllog import FallLog
 from .falllogdialog import FallLogDialog
@@ -21,6 +24,7 @@ class MainWindow(QMainWindow):
         self._state_detail = None
         self._flash = False
         self._people = 0
+        self._leader_id = 0  # person closest to a confirmed fall (0 = none)
         self._frame_times = deque(maxlen=30)
         self._falls_today = 0
         self.location = LocationFeed(self)
@@ -28,6 +32,9 @@ class MainWindow(QMainWindow):
         self.log_dialog = None
         self.alarm = AlarmSound(self)
         self.settings = QSettings("Vertebrate", "Vertebrate")  # per-user, per-device preferences
+        self.notifier = DiscordNotifier(self.settings, self)  # caregiver alerts (off until set up)
+        self.notifier.result.connect(self.notification_result)
+        self._last_notice = None  # (time text, delivered or None while sending, detail) of the latest alert
         self.setWindowTitle("Vertebrate · Fall Monitor")
         self.resize(1360, 860)
         self.setMinimumSize(1000, 640)
@@ -43,7 +50,7 @@ class MainWindow(QMainWindow):
         body.addLayout(self._build_main(), 1)
         body.addWidget(self._build_sidebar())
         outer.addLayout(body, 1)
-        footer = make_label("Processing stays on this device  ·  Local alarm only — no external emergency dispatch",
+        footer = make_label("Video stays on this device  ·  Caregiver alerts are optional  ·  Not connected to emergency services",
                             12, obj="caption")
         outer.addWidget(footer)
         self.setCentralWidget(root)
@@ -71,6 +78,7 @@ class MainWindow(QMainWindow):
         self.clock_timer.start()
 
         self.update_log_button()
+        self.refresh_caregiver_card()
         self.alarm_delay_changed(self.alarm_delay.value(), save=False)
         self.set_state("idle")
         self.tick()
@@ -201,7 +209,7 @@ class MainWindow(QMainWindow):
         self.evidence_label = make_label(f"0 of {CONSECUTIVE_FRAMES} frames", 13, QFont.Weight.DemiBold, mono=True)
         row.addWidget(self.evidence_label)
         row.addStretch()
-        row.addWidget(make_label(f"Alert after {CONSECUTIVE_FRAMES} in a row", 12, obj="muted"))
+        row.addWidget(make_label(f"{CONSECUTIVE_FRAMES} in a row, same person", 12, obj="muted"))
         layout.addLayout(row)
         column.addWidget(card)
 
@@ -259,6 +267,18 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.alarm_hint)
         column.addWidget(card)
 
+        card, layout = self._card("Caregiver alerts")
+        self.care_status = make_label("", 15, QFont.Weight.DemiBold)
+        self.care_detail = make_label("", 12, obj="muted", wrap=True)
+        self.care_button = QPushButton("Set up Discord…")
+        self.care_button.setObjectName("ghost")
+        self.care_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.care_button.clicked.connect(self.open_caregivers)
+        layout.addWidget(self.care_status)
+        layout.addWidget(self.care_detail)
+        layout.addWidget(self.care_button)
+        column.addWidget(card)
+
         column.addStretch()
         scroll.setWidget(inner)
         return scroll
@@ -275,17 +295,22 @@ class MainWindow(QMainWindow):
             self._flash = False
         self.apply_state()
 
+    def _who(self) -> str:
+        current = self.fall_log.current
+        return people_text(current["people"]) if current is not None else "Person"
+
     def _fall_detail(self) -> str:
         current = self.fall_log.current
         fallen_for = format_duration(self.fall_log.ongoing_seconds())
         delay = self.alarm_delay.value()
         if current is None:
             return "Fall posture detected."
+        who = self._who()
         if delay == 0:
-            return f"Fallen for {fallen_for}. The alarm is off."
+            return f"{who} down for {fallen_for}. The alarm is off."
         if current["alarm_rang"] is None:
-            return f"Fallen for {fallen_for}. Alarm in {self._alarm_remaining()} s."
-        return f"Fallen for {fallen_for}. Alarm silenced."
+            return f"{who} down for {fallen_for}. Alarm in {self._alarm_remaining()} s."
+        return f"{who} down for {fallen_for}. Alarm silenced."
 
     def _alarm_remaining(self) -> int:
         return max(0, int(self.alarm_delay.value() - self.fall_log.ongoing_seconds() + 0.999))
@@ -301,7 +326,8 @@ class MainWindow(QMainWindow):
             "monitoring": ("All clear", self._monitoring_detail()),
             "fall": ("Fall detected", self._fall_detail()),
             "alarm": ("Emergency alarm",
-                      f"Fallen for {format_duration(self.fall_log.ongoing_seconds())}. Siren ringing on this device."),
+                      f"{self._who()} down for {format_duration(self.fall_log.ongoing_seconds())}. "
+                      "Siren ringing on this device."),
             "stopping": ("Stopping…", "Releasing the camera."),
             "error": ("Something went wrong", "Check the message below and try again."),
         }[state]
@@ -328,14 +354,15 @@ class MainWindow(QMainWindow):
         self.video.set_border(border[0], border[1], live)
 
         if state == "fall":
-            self.banner_title.setText("Fall detected")
+            self.banner_title.setText(f"Fall detected — {self._who().lower()}")
             self.banner_detail.setText(self._fall_detail())
             self.banner.setStyleSheet(
                 f"QFrame#banner {{ background: {rgba(WARN, .13)}; border: 1px solid {rgba(WARN, .55)};"
                 f" border-radius: 14px; }} QLabel {{ color: {TEXT}; }}")
             self.banner_icon.setStyleSheet(f"color: #1A0E06; background: {WARN}; border-radius: 18px;")
         elif state == "alarm":
-            self.banner_title.setText(f"EMERGENCY ALARM — fallen for {format_duration(self.fall_log.ongoing_seconds())}")
+            self.banner_title.setText(f"EMERGENCY ALARM — {self._who().lower()} down for "
+                                      f"{format_duration(self.fall_log.ongoing_seconds())}")
             self.banner_detail.setText("A siren is ringing on this device. Check on the person, then silence it.")
             self.banner.setStyleSheet(
                 f"QFrame#banner {{ background: {color}; border: 1px solid {rgba('#FFFFFF', .25)};"
@@ -374,7 +401,10 @@ class MainWindow(QMainWindow):
             self.stat_alarm.set(f"{self._alarm_remaining()} s", WARN)
         else:
             self.stat_alarm.set(f"{delay} s")
-        self.evidence_label.setText(f"{self.meter.value} of {CONSECUTIVE_FRAMES} frames")
+        if self._leader_id and self.meter.value:
+            self.evidence_label.setText(f"#{self._leader_id} · {self.meter.value} of {CONSECUTIVE_FRAMES}")
+        else:
+            self.evidence_label.setText(f"{self.meter.value} of {CONSECUTIVE_FRAMES} frames")
 
     def refresh_location(self) -> None:
         fix = self.location.current_fix()
@@ -412,6 +442,7 @@ class MainWindow(QMainWindow):
         self._stopping = False
         self._frame_times.clear()
         self._people = 0
+        self._leader_id = 0
         self.meter.set_value(0)
         self.start_button.setEnabled(False)
         self.stop_button.setEnabled(True)
@@ -436,8 +467,8 @@ class MainWindow(QMainWindow):
         self.set_state("stopping")
         self.stop_timer.start()
 
-    @Slot(QImage, bool, int, int)
-    def show_frame(self, image, is_fallen, evidence, people):
+    @Slot(QImage, bool, int, int, int, list)
+    def show_frame(self, image, is_fallen, evidence, leader_id, people, confirmed_ids):
         worker = self.sender()
         try:
             if worker is not self.worker or self._stopping:
@@ -446,9 +477,15 @@ class MainWindow(QMainWindow):
             self.video.set_frame(QPixmap.fromImage(image))
             self._frame_times.append(time.monotonic())
             self._people = people
+            self._leader_id = leader_id
             self.meter.set_value(evidence)
-            if self.fall_log.update(is_fallen, self.location.current_fix()):
+            was_falling = self.fall_log.current is not None
+            if self.fall_log.update(is_fallen, self.location.current_fix(), confirmed_ids):
                 self.log_changed()
+                if not was_falling and self.fall_log.current is not None:
+                    self.notify_fall_started()
+                elif was_falling and self.fall_log.current is None:
+                    self.notify_fall_ended()
             self.check_alarm()
             # An ongoing fall event (including its 2 s grace) keeps the fall state,
             # so the banner does not flicker on single missed frames.
@@ -481,6 +518,7 @@ class MainWindow(QMainWindow):
         reason = f"Error: {self._error}" if self._error else ("App closed" if self._closing else "Camera stopped")
         if self.fall_log.close_event(reason):
             self.log_changed()
+            self.notify_fall_ended()
         self.location.stop()
         worker = self.worker
         self.worker = None
@@ -488,6 +526,7 @@ class MainWindow(QMainWindow):
             worker.deleteLater()
         self._stopping = False
         self._people = 0
+        self._leader_id = 0
         self._frame_times.clear()
         self.meter.set_value(0)
         self.start_button.setEnabled(True)
@@ -522,6 +561,7 @@ class MainWindow(QMainWindow):
                 and self.fall_log.ongoing_seconds() >= delay):
             self.fall_log.mark_alarm(delay)
             self.alarm.start()
+            self.notify_alarm()
             self.set_state("alarm")
             self.silence_button.setFocus()  # Space/Enter silences it
             self.raise_()
@@ -574,11 +614,111 @@ class MainWindow(QMainWindow):
         self.log_dialog.raise_()
         self.log_dialog.activateWindow()
 
+    # -- caregiver alerts ----------------------------------------------------
+    def _send_caregiver(self, kind: str, title: str, description: str, location, mention: bool,
+                        extra_fields=None) -> None:
+        embed = caregiver_embed(kind, self.fall_log.device, title, description, location, extra_fields)
+        if self.notifier.send(kind, embed, mention):
+            self._last_notice = (datetime.now().strftime("%H:%M:%S"), None, "Sending…", "alert")
+            self.refresh_caregiver_card()
+
+    def notify_fall_started(self) -> None:
+        current = self.fall_log.current
+        delay = self.alarm_delay.value()
+        when = current["start"].strftime("%H:%M:%S on %d %b %Y")
+        follow = (f"The alarm will ring in {format_duration(delay)} if they stay down." if delay
+                  else "The alarm on the device is off.")
+        self._send_caregiver(
+            "fall", f"⚠️ Fall detected — {self._who()}",
+            f"A fall was detected on **{self.fall_log.device}** at {when}. {follow}",
+            current["location"], mention=True)
+
+    def notify_alarm(self) -> None:
+        current = self.fall_log.current
+        if current is None:
+            return
+        self._send_caregiver(
+            "alarm", f"🚨 EMERGENCY — {self._who()} still down",
+            f"Down for **{format_duration(self.fall_log.ongoing_seconds())}** on **{self.fall_log.device}**. "
+            "The siren is ringing. Please check on them now.",
+            current["location"], mention=True)
+
+    def notify_fall_ended(self) -> None:
+        row = self.fall_log.last_finished
+        if row is None:
+            return
+        extra = [{"name": "Ended by", "value": row["ended_by"], "inline": True},
+                 {"name": "Duration", "value": row["duration"], "inline": True}]
+        if row.get("alarm_rang_at"):
+            alarm = f"Rang {row['alarm_rang_at'][-8:]}"
+            if row.get("alarm_silenced_at"):
+                alarm += f", silenced {row['alarm_silenced_at'][-8:]}"
+            extra.append({"name": "Alarm", "value": alarm, "inline": True})
+        self._send_caregiver(
+            "end", f"✅ Fall ended — {people_text(row.get('people', []))}",
+            f"{people_text(row.get('people', []))} was down for {row['duration']} on **{self.fall_log.device}** "
+            f"({row['fall_detected_at'][-8:]}–{row['ended_at'][-8:]}).",
+            row["location"], mention=False, extra_fields=extra)
+
+    @Slot(str, bool, str)
+    def notification_result(self, kind, delivered, detail):
+        if kind == "test" and not self.notifier.config.get("fixed"):
+            return  # the setup window shows its own result
+        self._last_notice = (datetime.now().strftime("%H:%M:%S"), delivered, detail,
+                             "test" if kind == "test" else "alert")
+        self.refresh_caregiver_card()
+
+    def refresh_caregiver_card(self) -> None:
+        config = self.notifier.config
+        if not self.notifier.active:
+            self.care_status.setText("Not set up" if not config["enabled"] else "Needs attention")
+            self.care_status.setStyleSheet(f"color: {FAINT if not config['enabled'] else WARN};")
+            self.care_detail.setText("Notify caregivers in a Discord channel when someone falls."
+                                     if not config["enabled"] else caregiver_config_problem(config) or "")
+            self.care_detail.setStyleSheet("")
+            self.care_button.setText("Set up Discord…")
+            return
+        events = [name for key, name in (("on_fall", "falls"), ("on_alarm", "alarms"), ("on_end", "recoveries"))
+                  if config[key]]
+        fixed = config.get("fixed", False)
+        via = "fixed channel" if fixed else ("bot" if config["mode"] == "bot" else "webhook")
+        self.care_status.setText(f"Discord · on ({via})")
+        self.care_status.setStyleSheet(f"color: {OK};")
+        detail = "Sends: " + (", ".join(events) if events else "nothing (all events switched off)")
+        failed = False
+        if self._last_notice is not None:
+            at, delivered, text, what = self._last_notice
+            if delivered is None:
+                detail += f"\nLast {what} {at}: sending…"
+            elif delivered:
+                detail += f"\nLast {what} {at}: delivered"
+            else:
+                detail += f"\nLast {what} {at} failed: {text}"
+                failed = True
+        self.care_detail.setText(detail)
+        self.care_detail.setStyleSheet(f"color: {DANGER};" if failed else "")
+        self.care_button.setText("Send test message" if fixed else "Discord settings…")
+
+    @Slot()
+    def open_caregivers(self):
+        if self.notifier.config.get("fixed"):  # fixed channel: the button just sends a test
+            embed = caregiver_embed("test", self.fall_log.device, "✅ Vertebrate test message",
+                                    f"Caregiver alerts from **{self.fall_log.device}** are working. "
+                                    "Real alerts will look like this, with times and location.")
+            if self.notifier.send("test", embed, mention=False, config=self.notifier.config):
+                self._last_notice = (datetime.now().strftime("%H:%M:%S"), None, "Sending…", "test")
+                self.refresh_caregiver_card()
+            return
+        dialog = CaregiverDialog(self.notifier, self.fall_log.device, self)
+        dialog.exec()  # modal: monitoring keeps running underneath
+        self.refresh_caregiver_card()
+
     def closeEvent(self, event: QCloseEvent):
         if self.worker is not None:
             self._closing = True
             self.stop_camera()
             event.ignore()  # Never destroy a running QThread or block the GUI.
         else:
+            self.notifier.flush(3.0)  # let a last "fall ended" alert go out (bounded wait)
             event.accept()
 

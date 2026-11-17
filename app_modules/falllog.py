@@ -4,9 +4,10 @@ from .common import *  # shared Qt imports, constants, and helpers
 class FallLog:
     """Per-device CSV of confirmed fall alerts. GUI thread only.
 
-    An event starts when the debounced alert turns on and ends when the alert
-    has stayed off for END_GRACE_S (end time = when it first went off), or when
-    the camera stops. One row is appended per finished event. The file lives in
+    An event starts when any person's fall is confirmed (five consecutive fallen
+    frames of that one person) and ends when no one has been confirmed for
+    END_GRACE_S (end time = when it first went off), or when the camera stops.
+    person_ids lists who was confirmed; IDs restart with each camera session. One row is appended per finished event. The file lives in
     runtime/logs/falls/<device>.csv and opens directly in Excel or Numbers.
     """
 
@@ -17,16 +18,19 @@ class FallLog:
         self.current = None       # ongoing event: {"start": datetime, "location": tuple | None}
         self._clear_since = None  # when the alert of the ongoing event last went off
         self.last_error = None
+        self.last_finished = None  # the event _finish() just wrote (for caregiver alerts)
 
-    def update(self, is_fallen: bool, location) -> bool:
-        """Feed the alert state of each displayed frame. True if the log changed."""
+    def update(self, is_fallen: bool, location, person_ids=()) -> bool:
+        """Feed the alert state of each displayed frame, with the IDs of the people
+        whose fall is confirmed. True if the log changed."""
         now = datetime.now().astimezone()
         if is_fallen:
             self._clear_since = None
             if self.current is None:
-                self.current = {"start": now, "location": location,
+                self.current = {"start": now, "location": location, "people": set(person_ids),
                                 "alarm_after": None, "alarm_rang": None, "alarm_silenced": None}
                 return True
+            self.current["people"].update(person_ids)  # someone else may fall during the event
             if self.current["location"] is None and location is not None:
                 self.current["location"] = location  # first fix arrived mid-event
             return False
@@ -83,7 +87,9 @@ class FallLog:
             "alarm_after_seconds": event["alarm_after"] if event["alarm_after"] is not None else "",
             "alarm_rang_at": stamp(event["alarm_rang"]),
             "alarm_silenced_at": stamp(event["alarm_silenced"]),
+            "person_ids": ";".join(str(i) for i in sorted(event["people"])),
         }
+        self.last_finished = {**row, "location": location, "seconds": seconds, "people": sorted(event["people"])}
         try:
             FALL_LOG_DIR.mkdir(parents=True, exist_ok=True)
             self._upgrade_header()
