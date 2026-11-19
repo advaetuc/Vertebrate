@@ -1,5 +1,5 @@
 """Shared imports, settings, constants, and helper functions."""
-r"""Standalone webcam pose demo for Windows and macOS.
+"""Standalone webcam pose demo for Windows and macOS.
 
 Run:  Windows  .venv\Scripts\python.exe app.py
       macOS    .venv/bin/python app.py
@@ -142,11 +142,56 @@ else:
     CAMERA_BACKENDS = (cv2.CAP_ANY,)
     CAMERA_HELP = "Cannot open camera 0. Close other camera apps and check camera permissions."
 
+# Close-range guard ---------------------------------------------------------
+# Someone very near the camera fills the frame: only the head and shoulders are
+# in view and their box is wide, which used to look like lying down. Such a
+# person is labelled "too close" and not judged; and the wide-box rule needs
+# the lower body (a hip plus a knee or ankle) to be visible.
+TOO_CLOSE_AREA = 0.45   # box covers more than this share of the frame
+EDGE_PX = 4             # a box side this close to the frame edge is cut off
+HIPS = (11, 12)         # COCO keypoint indices
+LEGS = (13, 14, 15, 16)  # knees and ankles
+TOO_CLOSE_BGR = (0, 170, 255)  # OpenCV BGR, for "too close" (UI hex colours are defined further down)
+
+
+def joint_visible(keypoints, index: int) -> bool:
+    """Ultralytics zeroes joints it is not confident about."""
+    if keypoints is None or len(keypoints) <= index:
+        return False
+    x, y = keypoints[index][0], keypoints[index][1]
+    return bool(np.isfinite(x) and np.isfinite(y) and x > 0 and y > 0)
+
+
+def lower_body_visible(keypoints) -> bool:
+    return (any(joint_visible(keypoints, i) for i in HIPS)
+            and any(joint_visible(keypoints, i) for i in LEGS))
+
+
+def too_close(box, frame_w: int, frame_h: int) -> bool:
+    """Box covers most of the frame, or runs from its top edge to its bottom edge
+    (a standing person close up; someone lying down never spans the full height)."""
+    if frame_w <= 0 or frame_h <= 0:
+        return False
+    x1, y1, x2, y2 = map(float, box)
+    area_share = max(0.0, x2 - x1) * max(0.0, y2 - y1) / (frame_w * frame_h)
+    spans_height = y1 <= EDGE_PX and y2 >= frame_h - EDGE_PX
+    return area_share > TOO_CLOSE_AREA or spans_height
+
+
+def posture_state(box, keypoints, frame_w: int, frame_h: int) -> str:
+    """'too_close', 'fallen' or 'standing' for one detected person."""
+    if too_close(box, frame_w, frame_h):
+        return "too_close"
+    return "fallen" if fallen_geometry(box, keypoints) else "standing"
+
+
 def fallen_geometry(box, keypoints):
-    """Exact requested OR rule; missing (zeroed) joints cannot define a spine."""
+    """OR rule: a wide box (only when the lower body is visible, so a close-up
+    head and shoulders cannot count) or an inverted spine; missing (zeroed)
+    joints cannot define a spine."""
     x1, y1, x2, y2 = map(float, box)
     height = y2 - y1
-    wide = height > 0 and (x2 - x1) / height > 1.2
+    wide = height > 0 and (x2 - x1) / height > 1.2 and lower_body_visible(keypoints)
     inverted = False
     if keypoints is not None and len(keypoints) >= 13:
         core = np.asarray(keypoints)[[5, 6, 11, 12]]
@@ -164,10 +209,13 @@ def annotate(frame, result, tracker):
     boxes = result.boxes.xyxy.cpu().numpy() if result.boxes is not None else np.empty((0, 4))
     points = result.keypoints.xy.cpu().numpy() if result.keypoints is not None else None
     joints_list = [points[i] if points is not None and i < len(points) else None for i in range(len(boxes))]
-    fallen = [fallen_geometry(box, joints) for box, joints in zip(boxes, joints_list)]
+    frame_h, frame_w = frame.shape[:2]
+    states = [posture_state(box, joints, frame_w, frame_h) for box, joints in zip(boxes, joints_list)]
+    fallen = [state == "fallen" for state in states]  # "too close" never counts towards a fall
     tracks = tracker.update(boxes, fallen)
-    for box, joints, is_fallen, track in zip(boxes, joints_list, fallen, tracks):
-        color = RED if is_fallen else GREEN
+    for box, joints, state, track in zip(boxes, joints_list, states, tracks):
+        is_fallen = state == "fallen"
+        color = RED if is_fallen else TOO_CLOSE_BGR if state == "too_close" else GREEN
         thickness = 4 if track.confirmed else 2
         x1, y1, x2, y2 = map(int, box)
         cv2.rectangle(frame, (x1, y1), (x2, y2), color, thickness)
@@ -175,6 +223,8 @@ def annotate(frame, result, tracker):
             text = f"#{track.id} FALL CONFIRMED"
         elif is_fallen:
             text = f"#{track.id} Fallen posture {track.streak}/{CONSECUTIVE_FRAMES}"
+        elif state == "too_close":
+            text = f"#{track.id} Too close to camera"
         else:
             text = f"#{track.id} Standing"
         cv2.putText(frame, text, (x1, max(22, y1 - 8)), cv2.FONT_HERSHEY_SIMPLEX, .6, color, 2, cv2.LINE_AA)
@@ -438,4 +488,3 @@ def apply_dark_theme(application: QApplication) -> None:
     font = QFontDatabase.systemFont(QFontDatabase.SystemFont.GeneralFont)
     font.setPixelSize(14)
     application.setFont(font)
-
