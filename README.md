@@ -181,6 +181,7 @@ models/                      Local weights and provenance
 data/videos/                 Preserved local footage; Git-ignored
 runtime/                     Generated local settings; Git-ignored
 .archive/                    Legacy backups; Git-ignored
+docs/acknowledgements/       Project acknowledgement letter
 ```
 
 `requirements.txt` is the V1 installation path. The historical lock includes
@@ -195,6 +196,21 @@ image scale. Development observations are not an independently validated
 accuracy guarantee.
 
 **Local demo — no external emergency dispatch.**
+
+## Project acknowledgement
+
+On 16 November 2026, Dr. Shilpi Vijay of Back in Action Physiotherapy Clinic
+issued a letter acknowledging the VERTEBRATE concept and expressing interest
+in its potential relevance to healthcare. The letter appreciates the student
+team's initiative and encourages continued development. It explicitly states
+that it is **not** clinical validation, approval of the current prototype, or
+a commitment to implementation or financial sponsorship. It does not verify
+the system's accuracy, safety, or suitability for care decisions.
+
+The scanned letter is preserved at
+[`docs/acknowledgements/vertebrate-clinic-acknowledgement-2026-11-16.pdf`](docs/acknowledgements/vertebrate-clinic-acknowledgement-2026-11-16.pdf).
+The letter is separate from this software's license and does not endorse any
+clinical use of the prototype.
 
 ## License
 

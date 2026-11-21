@@ -19,3 +19,17 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+---
+
+## Project acknowledgement (not a software license)
+
+The project documentation includes a letter dated 16 November 2026 from
+Dr. Shilpi Vijay of Back in Action Physiotherapy Clinic acknowledging the
+VERTEBRATE concept and expressing interest in its potential. The letter
+explicitly states that it is not clinical validation, approval of the current
+prototype, or a commitment to implementation or financial sponsorship. It
+grants no rights to this software or to any third-party software or model
+assets, and does not change the MIT License above. See
+[`docs/acknowledgements/vertebrate-clinic-acknowledgement-2026-11-16.pdf`](docs/acknowledgements/vertebrate-clinic-acknowledgement-2026-11-16.pdf)
+and the project's [README](README.md#project-acknowledgement).
