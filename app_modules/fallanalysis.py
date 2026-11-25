@@ -2,8 +2,9 @@
 the watch after a confirmed fall: is the person moving, lying still, or
 back on their feet? (phase 1), who else is around them: nearby, coming
 over, or already with them (phase 2), and how the fall happened -- sudden or
-gradual -- with a priority for each fall (phase 3). Phase 4 (fall patterns)
-builds on the same history.
+gradual -- with a priority for each fall (phase 3), and the pattern of a
+sudden fall: collapse, slip or trip (phase 5A). Phase 5B (patterns of gradual
+falls) builds on the same history.
 Pure Python + NumPy, same on Windows and macOS. Worker thread only."""
 from .common import *  # shared Qt imports, constants, and helpers
 import warnings
@@ -266,6 +267,7 @@ MOVING_RECENT_S = 3.0      # moved within this long -> "moving"
 RECOVER_S = 1.0            # standing this long after a fall -> got up
 RECOVER_RISE = 0.8         # ...with the hips this many torso lengths above where they were
 WATCH_KEEP_S = 10.0        # a recovery is still reported this long afterwards
+LANDING_S = 1.5            # movement in this long after confirmation is the landing itself: ignored
 
 # Sudden vs gradual (phase 3) ------------------------------------------------------
 # Descent time = how long the hips take to go from standing height to the floor,
@@ -337,9 +339,10 @@ def descent_analysis(history: PoseHistory) -> dict:
         return t0 if y1 == y0 else t0 + (t1 - t0) * (level - y0) / (y1 - y0)
     i10_end = next(i for i in range(i10, i90) if points[i + 1][1] > low)
     i90_start = max(i for i in range(i10, i90) if points[i][1] < high)
-    seconds = (when(i90_start, high) - when(i10_end, low)) / DESCENT_SHARE
-    seconds = max(seconds, 0.0)
+    t_low, t_high = when(i10_end, low), when(i90_start, high)
+    seconds = max((t_high - t_low) / DESCENT_SHARE, 0.0)
     return {
+        "t_start": t_low, "t_end": t_high,  # when the hips passed 10 % and 90 % of the drop
         "type": "sudden" if seconds < SUDDEN_MAX_S else "gradual",
         "descent_s": round(seconds, 2),
         "drop": round(drop, 2),
@@ -349,22 +352,48 @@ def descent_analysis(history: PoseHistory) -> dict:
 
 
 def fall_type_text(report: dict) -> str:
-    """'Sudden fall (down in 0.6 s)', 'Gradual fall (down in 3.2 s)', 'Fall type unclear'."""
+    """'Sudden fall (down in 0.6 s)', 'Gradual fall (down in 3.2 s)', 'Fall type unclear'.
+    With a pattern: 'Possible slip — sudden fall (down in 0.6 s)'."""
     kind = report.get("fall_type", "unclear")
     if kind == "unclear" or report.get("descent_s") is None:
         return "Fall type unclear"
     text = f"{kind.capitalize()} fall (down in {report['descent_s']:.1f} s"
-    return text + (", borderline)" if report.get("borderline") else ")")
+    text += ", borderline)" if report.get("borderline") else ")"
+    pattern = report.get("pattern")
+    if pattern in PATTERN_TEXT:
+        text = f"{PATTERN_TEXT[pattern][0]} — {text[0].lower()}{text[1:]}"
+    return text
+
+
+def pattern_detail(report: dict) -> str:
+    """One line on why: 'Hips reached the floor first; fell backwards; arms reached out.'"""
+    if report.get("pattern") not in PATTERN_TEXT:
+        return ""
+    parts = []
+    first = report.get("first_contact")
+    if first:
+        parts.append(f"{PART_NAMES[first]} reached the floor first")
+    if report.get("direction"):
+        parts.append(f"fell {report['direction']}")
+    arms = report.get("arms")
+    if arms is True:
+        parts.append("arms reached out")
+    elif arms is False:
+        parts.append("no arm movement to break the fall")
+    return ("; ".join(parts) + ".").capitalize() if parts else ""
 
 
 def priority_of(report: dict) -> str:
-    """Priority for one fallen person (phase 3 rules; phase 4 refines them):
-    got up -> recovered; lying still -> critical; sudden or unclear -> urgent;
+    """Priority for one fallen person (phase 3 rules, refined by patterns):
+    got up -> recovered; lying still, or a collapse and not moving since ->
+    critical; sudden or unclear -> urgent;
     gradual -> check (a slow, controlled descent)."""
     if report.get("status") == "recovered":
         return "recovered"
     if report.get("status") == "still" or (report.get("critical") and report.get("status") != "moving"):
         return "critical"
+    if report.get("pattern") == "collapse" and report.get("status") != "moving":
+        return "critical"  # sudden, no protective reaction: possible loss of consciousness
     if report.get("fall_type") == "gradual" and not report.get("borderline"):
         return "check"
     return "urgent"
@@ -373,6 +402,140 @@ def priority_of(report: dict) -> str:
 def highest_priority(priorities) -> str | None:
     found = [p for p in priorities if p in PRIORITIES]
     return min(found, key=PRIORITIES.index) if found else None
+
+
+# Patterns of a sudden fall (phase 5A) -------------------------------------------
+# Which body part reaches the floor first, whether the arms reach out to break
+# the fall, and the direction. Each part's "floor" is where that part ends up
+# when lying, so this works whatever the camera angle; a part has "landed" when
+# it has covered LANDED_SHARE of its own drop.
+PARTS = {"hips": (11, 12), "knees": (13, 14), "hands": (9, 10), "upper": (0, 5, 6)}
+PART_NAMES = {"hips": "hips", "knees": "knees", "hands": "hands", "upper": "head or shoulders"}
+LANDED_SHARE = 0.85        # share of a part's own drop that counts as "on the floor"
+MIN_PART_DROP = 0.4        # torso lengths a part must drop to be timed at all
+TIE_S = 0.1                # parts landing this close together landed "at the same time"
+ARM_OUT_TORSOS = 0.8       # wrist this far from the shoulder-hip segment = arm out
+ARM_OUT_FRAMES = 2         # ...on at least this many frames of the fall
+FACING_MIN = 0.15          # nose this far ahead of the shoulders (profile view) = facing that way
+DIRECTION_MIN = 0.8        # head must end this far from the hips' start, sideways in the image
+PATTERN_PRE_S, PATTERN_POST_S = 0.4, 0.6  # analysed window around the drop of the hips
+
+PATTERN_TEXT = {           # label, what it may mean (always "possible": camera analysis only)
+    "collapse": ("Collapse", "possible loss of consciousness (fainting, seizure or a heart problem)"),
+    "slip": ("Possible slip", "fell backwards or onto the hips"),
+    "trip": ("Possible trip", "fell forwards and tried to break the fall"),
+}
+
+
+def _distance_to_segment(point, a, b) -> float:
+    """Distance (pixels) from `point` to the segment a-b: an arm hanging along the
+    body is close to the shoulder-hip segment; an arm reaching forwards, sideways
+    or up over the head is far from it."""
+    ab, ap = b - a, point - a
+    u = float(np.clip(np.dot(ap, ab) / max(float(np.dot(ab, ab)), 1e-9), 0.0, 1.0))
+    return float(np.hypot(*(ap - u * ab)))
+
+
+def _part_track(samples, indices):
+    """(time, x, y) of the mean of the visible joints in `indices`, per sample."""
+    track = []
+    for sample in samples:
+        point = joint_midpoint(sample.joints, indices)
+        if point is not None:
+            track.append((sample.t, float(point[0]), float(point[1])))
+    return track
+
+
+def fall_pattern(history: PoseHistory, descent: dict) -> dict:
+    """Pattern of a SUDDEN fall: 'collapse', 'slip', 'trip' or 'unclear'.
+    Gradual falls return pattern None (phase 5B). Returns also first_contact
+    (a PARTS key or None), direction ('forward' / 'backward' / None) and arms
+    (True = reached out, False = did not, None = not visible)."""
+    result = {"pattern": None, "first_contact": None, "direction": None, "arms": None}
+    if descent.get("type") != "sudden" or "t_start" not in descent:
+        return result
+    result["pattern"] = "unclear"
+    scale = history.body_scale()
+    samples = history.samples
+    if not scale or len(samples) < 4:
+        return result
+    t0, t1 = descent["t_start"] - PATTERN_PRE_S, descent["t_end"] + PATTERN_POST_S
+    before = [s for s in samples if s.t < descent["t_start"] and s.state == "standing"]
+    during = [s for s in samples if t0 <= s.t <= t1]
+    after = samples[-3:]
+    if not before or len(during) < 3:
+        return result
+
+    # 1. First contact: when each part covered LANDED_SHARE of its own drop.
+    landed = {}
+    for name, indices in PARTS.items():
+        start = _part_track(before[-4:], indices)
+        end = _part_track(after, indices)
+        track = _part_track(during, indices)
+        if not start or not end or len(track) < 3:
+            continue
+        y_start = float(np.median([y for _, _, y in start]))
+        y_end = float(np.median([y for _, _, y in end]))
+        if (y_end - y_start) / scale < MIN_PART_DROP:
+            continue
+        level = y_start + LANDED_SHARE * (y_end - y_start)
+        hit = next((t for t, _, y in track if y >= level), None)
+        if hit is not None:
+            landed[name] = hit
+    first_parts = []
+    if landed:
+        earliest = min(landed.values())
+        first_parts = [name for name, t in landed.items() if t - earliest <= TIE_S]
+        if "hands" in first_parts:
+            result["first_contact"] = "hands"   # hands down with anything else = hands first
+        elif len(first_parts) == 1:
+            result["first_contact"] = first_parts[0]
+        elif set(first_parts) == {"hips", "knees"}:
+            result["first_contact"] = None      # sat straight down: no clear order
+
+    # 2. Arms: did a wrist move well away from the body's axis during the fall?
+    out_frames = visible_frames = 0
+    for sample in during:
+        shoulders = joint_midpoint(sample.joints, SHOULDERS)
+        hips = joint_midpoint(sample.joints, HIPS)
+        wrists = [sample.joints[i] for i in (9, 10) if np.isfinite(sample.joints[i]).all()]
+        if shoulders is None or hips is None or not wrists:
+            continue
+        axis = hips - shoulders
+        length = float(np.hypot(*axis))
+        if length < MIN_TORSO_PX:
+            continue
+        visible_frames += 1
+        # distance of each wrist from the infinite line through shoulders and hips
+        away = max(_distance_to_segment(w, shoulders, hips) for w in wrists) / scale
+        out_frames += away >= ARM_OUT_TORSOS
+    if visible_frames >= max(2, len(during) // 2):
+        result["arms"] = out_frames >= ARM_OUT_FRAMES
+
+    # 3. Direction (profile views only): did the head end up on the side the person faced?
+    facing = []
+    for sample in before[-4:]:
+        nose, shoulders = sample.joints[0], joint_midpoint(sample.joints, SHOULDERS)
+        if np.isfinite(nose).all() and shoulders is not None:
+            facing.append((float(nose[0]) - float(shoulders[0])) / scale)
+    head_end = _part_track(after, PARTS["upper"])
+    hip_start = _part_track(before[-4:], HIPS)
+    if facing and head_end and hip_start and abs(float(np.median(facing))) >= FACING_MIN:
+        side = float(np.median([x for _, x, _ in head_end])) - float(np.median([x for _, x, _ in hip_start]))
+        if abs(side) / scale >= DIRECTION_MIN:
+            result["direction"] = "forward" if np.sign(side) == np.sign(np.median(facing)) else "backward"
+
+    # 4. Pattern from the three observations.
+    first, arms, direction = result["first_contact"], result["arms"], result["direction"]
+    if arms is False and first in ("knees", "upper"):
+        result["pattern"] = "collapse"      # buckled or toppled with no protective reaction
+    elif first == "hands" or (first == "knees" and arms) or (arms and direction == "forward"):
+        result["pattern"] = "trip"
+    elif first == "hips" or direction == "backward":
+        result["pattern"] = "slip"
+    elif arms is False and first is None and set(first_parts) == {"hips", "knees"}:
+        result["pattern"] = "collapse"      # dropped straight down, arms limp
+    return result
 
 
 # People around a fallen person (phase 2) ---------------------------------------
@@ -432,7 +595,7 @@ class PostFallWatch:
     __slots__ = ("confirmed_at", "last_t", "still_s", "longest_still_s", "moved", "last_move_t",
                  "critical_at", "moved_after_critical", "standing_since", "recovered_at",
                  "fall_hip_y", "scale", "above", "bystanders", "helpers", "helped_at",
-                 "nearby_since", "ever_nearby", "descent", "type_final")
+                 "nearby_since", "ever_nearby", "descent", "type_final", "pattern")
 
     def __init__(self, t: float, history: PoseHistory):
         self.confirmed_at = self.last_t = t
@@ -454,6 +617,7 @@ class PostFallWatch:
         self.nearby_since = None               # when someone was first nearby
         self.ever_nearby: set[int] = set()
         self.descent = descent_analysis(history)  # sudden / gradual, measured at confirmation
+        self.pattern = fall_pattern(history, self.descent)  # collapse / slip / trip (sudden falls)
         self.type_final = False                   # re-measured for TYPE_SETTLE_S, then fixed
 
     def update(self, t: float, history: PoseHistory, seen: bool) -> None:
@@ -463,6 +627,7 @@ class PostFallWatch:
             # The hips may still be settling when the fall is confirmed: re-measure briefly.
             if seen:
                 self.descent = descent_analysis(history)
+                self.pattern = fall_pattern(history, self.descent)
             self.type_final = t - self.confirmed_at >= TYPE_SETTLE_S
         latest = history.latest
         if not seen or latest is None or latest.t != t or self.recovered_at is not None:
@@ -474,6 +639,8 @@ class PostFallWatch:
                 return
         else:
             self.standing_since = None
+        if t - self.confirmed_at < LANDING_S:
+            return  # still landing: settling on the floor is not "moving"
         score = movement_score(history)
         if score is None:
             return
@@ -594,6 +761,7 @@ class PostFallWatch:
             "borderline": self.descent["borderline"],
             "type_note": self.descent["reason"],
             "type_final": self.type_final,
+            **self.pattern,
             **self.bystander_report(t),
         }
         report["priority"] = priority_of(report)
@@ -629,6 +797,8 @@ def watch_label(report: dict | None) -> str:
     status = report["status"]
     kind = report.get("fall_type")
     prefix = f" ({kind})" if kind in ("sudden", "gradual") else ""
+    if report.get("pattern") in PATTERN_TEXT:
+        prefix = f" ({report['pattern']})"
     return prefix + _status_label(report, status)
 
 

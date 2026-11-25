@@ -1,6 +1,6 @@
 """FallLog class."""
 from .common import *  # shared Qt imports, constants, and helpers
-from .fallanalysis import highest_priority
+from .fallanalysis import highest_priority, pattern_detail
 
 class FallLog:
     """Per-device CSV of confirmed fall alerts. GUI thread only.
@@ -69,7 +69,8 @@ class FallLog:
                 continue
             if report.get("fall_type"):
                 event["types"][pid] = (report["fall_type"], report.get("descent_s"), report.get("borderline", False),
-                                       report.get("type_final", True))
+                                       report.get("type_final", True), report.get("pattern"),
+                                       pattern_detail(report))
             if report.get("priority"):
                 event["priority_now"][pid] = report["priority"]
                 if report["priority"] != "recovered":  # the highest priority this fall reached
@@ -196,26 +197,29 @@ class FallLog:
         """True once the fall type of everyone in the ongoing fall is measured."""
         event = self.current
         return event is not None and bool(event["types"]) and all(
-            event["types"].get(pid, (None, None, False, False))[3] for pid in event["people"])
+            event["types"].get(pid, (None, None, False, False, None, ""))[3] for pid in event["people"])
 
     @staticmethod
     def type_fields(event: dict) -> dict:
         """Log fields for the fall type: the first person's (most falls have one)."""
         if not event["types"]:
-            return {"fall_type": "", "descent_seconds": ""}
+            return {"fall_type": "", "descent_seconds": "", "fall_pattern": "", "pattern_signs": ""}
         pid = min(event["types"])
-        kind, seconds, borderline, _final = event["types"][pid]
+        kind, seconds, borderline, _final, pattern, signs = event["types"][pid]
         label = kind + (" (borderline)" if borderline and kind != "unclear" else "")
-        return {"fall_type": label, "descent_seconds": f"{seconds:.1f}" if seconds is not None else ""}
+        return {"fall_type": label, "descent_seconds": f"{seconds:.1f}" if seconds is not None else "",
+                "fall_pattern": pattern or "", "pattern_signs": signs}
 
     @staticmethod
     def type_text(row: dict) -> str:
-        """'Sudden · 0.6 s', 'Gradual · 3.1 s', 'Unclear', or '—' for older rows."""
+        """'Sudden · slip · 0.6 s', 'Gradual · 3.1 s', 'Unclear', or '—' for older rows."""
         kind = row.get("fall_type") or ""
         if not kind:
             return "—"
         seconds = row.get("descent_seconds")
-        return kind.capitalize() + (f" · {seconds} s" if seconds else "")
+        pattern = row.get("fall_pattern") or ""
+        pattern = f" · {pattern}" if pattern and pattern != "unclear" else ""
+        return kind.capitalize() + pattern + (f" · {seconds} s" if seconds else "")
 
     @staticmethod
     def help_text(row: dict) -> str:

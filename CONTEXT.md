@@ -181,6 +181,32 @@ The banner colour and title follow `priority_now()`. Log fields added:
 (coloured) and Type. Known limits: at very low frame rates a fast fall can
 change the tracker ID, giving `unclear`; falls from sitting are `unclear`.
 
+### Patterns of a sudden fall (phase 5A)
+
+`fallanalysis.fall_pattern(history, descent)` runs only for `sudden` falls
+(gradual → `pattern` None, phase 5B). Window: hips' 10 % time − 0.4 s to 90 %
+time + 0.6 s (`descent` now carries `t_start` / `t_end`). First contact: for
+each part (`PARTS`: hips, knees, hands = wrists, upper = nose + shoulders) its
+own start (median of the last 4 standing frames) and end (last 3 frames) y; a
+part must drop ≥ 0.4 torso; it "landed" when it covered 85 % of its own drop
+(perspective-independent). Parts within 0.1 s tie; hands in a tie = hands
+first; hips+knees tie = no order. Arms: wrist distance from the shoulder–hip
+*segment* ≥ 0.8 torso on ≥ 2 frames = reached out (overhead arms count);
+judged only if wrists are visible on half the frames. Direction (profile only):
+facing = nose x − shoulder x (≥ 0.15 torso); head's final x vs hips' start x
+(≥ 0.8 torso) on the facing side = forward. Rules, in order: arms False and
+first knees/upper → collapse; hands first, or knees first with arms, or arms
+and forward → trip; hips first or backward → slip; arms False and hips+knees
+tie → collapse; else unclear. `priority_of`: collapse and not moving → critical.
+`PostFallWatch` ignores movement for `LANDING_S` 1.5 s after confirmation (the
+landing itself), so a collapse is not "moving" at once. Report adds `pattern`,
+`first_contact`, `direction`, `arms`; `fall_type_text()` and `pattern_detail()`
+build the text; `PATTERN_TEXT` holds label and meaning. Log fields added:
+`fall_pattern`, `pattern_signs`. Checked on keyframed stick-figure slips, trips
+and collapses (profile, mirrored, frontal; 8/12/15 fps): all correct with
+1.5 px wobble; with 3 px wobble on a small person 22/27 right, 4 unclear,
+1 collapse read as trip. Not yet checked on real footage.
+
 ### People around a fallen person (phase 2)
 
 `PostFallWatch.update_bystanders()` runs each frame for every watched (not

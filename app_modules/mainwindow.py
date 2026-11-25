@@ -6,7 +6,8 @@ from .caregivers import (
     CaregiverDialog, DiscordNotifier, caregiver_config_problem, caregiver_embed,
 )
 from .evidencemeter import EvidenceMeter
-from .fallanalysis import HISTORY_SECONDS, PRIORITY_STYLE, TYPE_SETTLE_S, fall_type_text
+from .fallanalysis import (HISTORY_SECONDS, PATTERN_TEXT, PRIORITY_STYLE, TYPE_SETTLE_S, fall_type_text,
+                           pattern_detail)
 from .falllog import FallLog
 from .falllogdialog import FallLogDialog
 from .locationfeed import LocationFeed
@@ -410,8 +411,7 @@ class MainWindow(QMainWindow):
             priority = self.fall_log.priority_now()
             tone = PRIORITY_STYLE[priority][3]
             word = PRIORITY_STYLE[priority][1].capitalize()
-            kind = self._type_text()
-            what = kind.split(" (")[0] if kind and not kind.startswith("Fall type") else "Fall detected"
+            what = self._what()
             if still:
                 self.banner_title.setText(f"{word} · No movement — {people_text(still).lower()} lying still")
                 self.banner_detail.setText(self._fall_detail() + " Check on them now.")
@@ -742,6 +742,36 @@ class MainWindow(QMainWindow):
                 return fall_type_text(self._aftermath[pid])
         return ""
 
+    def _first_report(self) -> dict:
+        current = self.fall_log.current
+        if current is None:
+            return {}
+        return next((self._aftermath[pid] for pid in sorted(current["people"]) if pid in self._aftermath), {})
+
+    def _what(self) -> str:
+        """Headline for the ongoing fall: 'Collapse', 'Possible slip', 'Sudden fall', 'Fall detected'."""
+        report = self._first_report()
+        if report.get("pattern") in PATTERN_TEXT:
+            return PATTERN_TEXT[report["pattern"]][0]
+        if report.get("fall_type") in ("sudden", "gradual"):
+            return f"{report['fall_type'].capitalize()} fall"
+        return "Fall detected"
+
+    def _pattern_fields(self, note: bool = True) -> list:
+        """'What it may mean' and 'Signs' fields when a pattern was recognised."""
+        report = self._first_report()
+        if report.get("pattern") not in PATTERN_TEXT:
+            return []
+        fields = [{"name": "What it may mean", "value": PATTERN_TEXT[report["pattern"]][1].capitalize(),
+                   "inline": False}]
+        signs = pattern_detail(report)
+        if signs:
+            fields.append({"name": "Signs", "value": signs, "inline": False})
+        if note:
+            fields.append({"name": "Note", "value": "Pattern from camera analysis — not a medical diagnosis.",
+                           "inline": False})
+        return fields
+
     def _priority_title(self, priority: str, what: str) -> str:
         emoji, word = PRIORITY_STYLE[priority][:2]
         return f"{emoji} {word} — {what} — {self._who()}"
@@ -755,11 +785,14 @@ class MainWindow(QMainWindow):
         help_text = self._help_text()
         priority = self.fall_log.priority_now()
         kind = self._type_text()
-        what = kind.split(" (")[0] if kind and not kind.startswith("Fall type") else "Fall detected"
+        what = self._what()
         fields = [{"name": "Priority", "value": PRIORITY_STYLE[priority][1].capitalize(), "inline": True},
                   {"name": "How they fell", "value": kind or "Fall type unclear", "inline": True}]
         if help_text:
             fields.append({"name": "People around", "value": help_text, "inline": True})
+        fields += self._pattern_fields()
+        if self._first_report().get("pattern") == "collapse":
+            follow = "They did not try to break the fall — please check on them immediately. " + follow
         self._send_caregiver(
             "fall", self._priority_title(priority, what),
             f"A fall was detected on **{self.fall_log.device}** at {when}. " + follow,
@@ -790,7 +823,7 @@ class MainWindow(QMainWindow):
             + "Please check on them immediately or call emergency services.",
             current["location"], mention=True,
             extra_fields=[{"name": "How they fell", "value": self._type_text() or "Fall type unclear",
-                           "inline": True},
+                           "inline": True}] + self._pattern_fields(note=False) + [
                           {"name": "Note", "value": "Movement judged from camera analysis — not a medical "
                                                      "diagnosis.", "inline": False}],
             priority="critical")

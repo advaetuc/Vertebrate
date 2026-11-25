@@ -208,7 +208,7 @@ title and colour, and the fall log:
 
 | Priority | When |
 |---|---|
-| 🔴 Critical | No movement for 15 s |
+| 🔴 Critical | No movement for 15 s, or a collapse |
 | 🟠 Urgent | Sudden fall, or type unclear |
 | 🟡 Check | Gradual fall (slow, controlled descent) |
 | 🟢 Recovered | Got up |
@@ -220,6 +220,28 @@ anything else needs to go out first. The fall log adds *fall type*, *descent
 seconds* and the *highest priority* the fall reached; the Fall log window shows
 *Priority* and *Type*. Priority does not change the siren, which follows the
 alarm delay you set.
+
+### How a sudden fall happened: collapse, slip or trip
+
+For a **sudden** fall, Vertebrate also looks at *how* the body went down:
+which part reached the floor first (hips, knees, hands, or head and shoulders),
+whether the arms reached out to break the fall, and — when the camera sees the
+person from the side — whether they fell forwards or backwards.
+
+| Pattern | Typical signs | Priority | What it may mean |
+|---|---|---|---|
+| **Collapse** | Knees or head/shoulders first, no arm movement to break the fall | 🔴 Critical | Possible loss of consciousness (fainting, seizure or a heart problem) |
+| **Possible slip** | Hips first, or fell backwards | 🟠 Urgent | Fell backwards or onto the hips |
+| **Possible trip** | Hands first, or knees first with arms out, or forwards with arms out | 🟠 Urgent | Fell forwards and tried to break the fall |
+| **Unclear** | Anything else | 🟠 Urgent | — |
+
+A collapse is Critical from the start (it drops to Urgent if the person
+moves). The Discord alert's title names the pattern ("🔴 CRITICAL — Collapse —
+Person #2") and adds *What it may mean* and *Signs* fields; the video label
+shows `(collapse)`, `(slip)` or `(trip)`; the fall log records the pattern
+and the signs. These are patterns seen by a camera, **not a medical
+diagnosis**. Patterns of gradual falls (hand to chest, unsteady, controlled)
+are the next step (phase 5B).
 
 ### People around a fallen person
 

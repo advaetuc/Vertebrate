@@ -124,7 +124,7 @@ LOG_FIELDS = (
     "alarm_after_seconds", "alarm_rang_at", "alarm_silenced_at", "person_ids",
     "after_fall", "longest_still_seconds", "no_movement_alert_at",
     "people_nearby", "helped_by", "help_after_seconds",
-    "fall_type", "descent_seconds", "priority",
+    "fall_type", "descent_seconds", "priority", "fall_pattern", "pattern_signs",
 )
 
 ALARM_DEFAULT_S = 30
