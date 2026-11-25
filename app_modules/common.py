@@ -1,5 +1,5 @@
 """Shared imports, settings, constants, and helper functions."""
-"""Standalone webcam pose demo for Windows and macOS.
+r"""Standalone webcam pose demo for Windows and macOS.
 
 Run:  Windows  .venv\Scripts\python.exe app.py
       macOS    .venv/bin/python app.py
@@ -201,9 +201,10 @@ def fallen_geometry(box, keypoints):
             inverted = shoulder_y > hip_y + 20.0
     return bool(wide or inverted)
 
-def annotate(frame, result, tracker):
+def annotate(frame, result, tracker, timestamp=None):
     """Paint this result onto its own frame and update per-person confirmation.
-    `tracker` is a tracking.PersonTracker (worker thread only).
+    `tracker` is a tracking.PersonTracker (worker thread only). With a
+    timestamp (time.monotonic()), each person's pose history is updated too.
     Returns (confirmed person IDs, leading person's streak, leading person's ID
     or 0, number of people detected)."""
     boxes = result.boxes.xyxy.cpu().numpy() if result.boxes is not None else np.empty((0, 4))
@@ -212,7 +213,7 @@ def annotate(frame, result, tracker):
     frame_h, frame_w = frame.shape[:2]
     states = [posture_state(box, joints, frame_w, frame_h) for box, joints in zip(boxes, joints_list)]
     fallen = [state == "fallen" for state in states]  # "too close" never counts towards a fall
-    tracks = tracker.update(boxes, fallen)
+    tracks = tracker.update(boxes, fallen, joints_list, states, timestamp)
     for box, joints, state, track in zip(boxes, joints_list, states, tracks):
         is_fallen = state == "fallen"
         color = RED if is_fallen else TOO_CLOSE_BGR if state == "too_close" else GREEN

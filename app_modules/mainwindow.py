@@ -26,6 +26,7 @@ class MainWindow(QMainWindow):
         self._people = 0
         self._leader_id = 0  # person closest to a confirmed fall (0 = none)
         self._frame_times = deque(maxlen=30)
+        self._detect_fps = None  # frames the detector processes per second (camera thread)
         self._falls_today = 0
         self.location = LocationFeed(self)
         self.fall_log = FallLog(device_name())
@@ -389,6 +390,8 @@ class MainWindow(QMainWindow):
         now = time.monotonic()
         recent = [t for t in self._frame_times if now - t <= 2.0]
         fps = (len(recent) - 1) / (recent[-1] - recent[0]) if len(recent) > 1 and recent[-1] > recent[0] else 0.0
+        if self._detect_fps is not None:
+            fps = self._detect_fps  # the rate fall analysis actually gets
         self.stat_fps.set(f"{fps:.1f}" if running else "—")
         self.stat_today.set(str(self._falls_today), WARN if self._falls_today else None)
         delay = self.alarm_delay.value()
@@ -441,6 +444,7 @@ class MainWindow(QMainWindow):
         self._error = None
         self._stopping = False
         self._frame_times.clear()
+        self._detect_fps = None
         self._people = 0
         self._leader_id = 0
         self.meter.set_value(0)
@@ -449,6 +453,7 @@ class MainWindow(QMainWindow):
         self.video.show_message("Starting camera…", "Loading the pose model. This takes a few seconds.")
         self.worker = CameraThread(self)
         self.worker.frame_ready.connect(self.show_frame, Qt.ConnectionType.QueuedConnection)
+        self.worker.stats_ready.connect(self.show_stats, Qt.ConnectionType.QueuedConnection)
         self.worker.error.connect(self.show_error, Qt.ConnectionType.QueuedConnection)
         self.worker.finished.connect(self.camera_finished, Qt.ConnectionType.QueuedConnection)
         self.set_state("starting")
@@ -503,6 +508,14 @@ class MainWindow(QMainWindow):
             if worker is not None:
                 worker.frame_consumed()
 
+    @Slot(float, float, int)
+    def show_stats(self, fps, inference_ms, history_frames):
+        if self.sender() is not self.worker or self._stopping:
+            return
+        self._detect_fps = fps
+        self.stat_fps.setToolTip(f"Detection rate {fps:.1f} frames/s · model {inference_ms:.0f} ms per frame\n"
+                                 f"A 5-second pose history holds {history_frames} frames per person.")
+
     @Slot(str)
     def show_error(self, message):
         self._error = message
@@ -528,6 +541,7 @@ class MainWindow(QMainWindow):
         self._people = 0
         self._leader_id = 0
         self._frame_times.clear()
+        self._detect_fps = None
         self.meter.set_value(0)
         self.start_button.setEnabled(True)
         self.stop_button.setEnabled(False)

@@ -112,6 +112,23 @@ only, never install headless or contrib variants alongside it. Python 3.12 x64
 on Windows is the documented environment. No inference-rate guarantee is
 specified.
 
+### Fall analysis groundwork (phase 0)
+
+`app_modules/fallanalysis.py` holds the base for the planned fall analysis.
+`PersonTracker.update(boxes, fallen, keypoints, states, timestamp)` appends each
+matched person's keypoints to their `Track.history` (`PoseHistory`, a 5 s ring
+buffer by time, capped at 300 samples). A missed frame adds no sample; it only
+trims old ones. `PoseHistory.normalized()` gives positions in torso lengths from
+the hip centre at the start of the window (image y points down, so a fall is y
+increasing); the body scale is the median torso length of standing frames.
+`annotate(..., timestamp)` passes the camera thread's `time.monotonic()` frame
+time. The camera thread's `FrameRateMeter` measures the rate the detector
+processes, which can be higher than the rate the window displays; it is emitted
+by `CameraThread.stats_ready(fps, model_ms, history_frames)` and shown in the
+Frames / second tile. Calling `update(boxes, fallen)` without a timestamp keeps
+the old behaviour and records no history. Nothing in this module changes an
+alert yet.
+
 ### Data architecture and state
 
 There is no application database or user record schema. The app does not save
@@ -123,6 +140,9 @@ log CSV (see "Fall log" below).
 | Webcam frame | Worker memory | BGR NumPy array, annotated in place |
 | Model result | One inference iteration | Boxes and `keypoints.xy` only |
 | Person tracks | Worker session | ID, last box, streak (cap 5), missed frames; dropped after 15 misses |
+| Pose history | Worker session, per track | Last 5 s of keypoints (NaN = not visible), box and posture state; `fallanalysis.PoseHistory`, read in torso lengths; informs no alert yet |
+| Frame rate | Worker session | `FrameRateMeter`: detector frames/s, model ms; `stats_ready` signal once a second |
+| Performance log | `runtime/logs/performance/<device>.csv` | One row per camera session: median/slowest fps, model ms, frame size, system; ignored by Git |
 | Display image | One pending signal | RGB QImage detached with `copy()` |
 | Display pixmap | Main window memory | Replaced on delivery and scaled on resize |
 | Model weights | Local filesystem | Root checked first, then `models/` |

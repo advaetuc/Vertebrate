@@ -32,6 +32,7 @@ the only optional network use is a text alert to caregivers on Discord.
 - `app_modules/camerathread.py`, `locationfeed.py`, `falllog.py`, and `alarmsound.py` — background camera, location, logging, and alarm components.
 - `app_modules/caregivers.py` — optional Discord caregiver alerts: sender, message format and setup window.
 - `app_modules/tracking.py` — per-person tracking (`PersonTracker`): IDs and each person's 5-frame fall check.
+- `app_modules/fallanalysis.py` — groundwork for fall analysis: each person's last 5 s of keypoints (`PoseHistory`, measured in torso lengths so near and far people compare) and the detector's real frame rate (`FrameRateMeter`).
 - `app_modules/falllogdialog.py` and the UI component modules (`videoview.py`, `evidencemeter.py`, `stattile.py`, `logomark.py`) — focused behavior and widgets.
 - `app_modules/common.py` — shared settings, constants, Qt imports, and helper functions.
 
@@ -168,6 +169,20 @@ The in-app settings are saved on this computer only, never in the project folder
 Git. Keep the webhook URL and bot token private: anyone with them can post to
 the channel. Alerts need an internet connection; the local alarm and fall log
 work without one. No extra packages are needed on Windows or macOS.
+
+### Frame rate and pose history
+
+The **Frames / second** tile shows how many frames the detector actually
+processes per second (hover it for the model time per frame). The terminal
+prints the same every 10 seconds as `[performance] …`, and each camera session
+adds one row to `runtime/logs/performance/<device>.csv` (median and slowest
+rate, model time, frame size, system). Numbers only; never images.
+
+Each tracked person also keeps their last 5 seconds of keypoints. Positions are
+measured in torso lengths (shoulders to hips), so a movement means the same
+whether the person is near or far from the camera. This history does not
+change any alert yet; it is the base for the planned fall analysis (movement
+after a fall, people nearby, sudden vs gradual falls).
 
 ## Workspace after cleanup
 

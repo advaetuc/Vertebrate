@@ -1,6 +1,7 @@
 """Per-person tracking: follows each detected person so a fall is confirmed
 for ONE person, not across the whole scene. Pure NumPy, same on Windows and macOS."""
 from .common import *  # shared Qt imports, constants, and helpers
+from .fallanalysis import PoseHistory
 
 # Per-person tracking -------------------------------------------------------
 # Detections are linked to people from frame to frame so a fall is confirmed for
@@ -30,14 +31,16 @@ def center_shift(a, b) -> float:
 
 
 class Track:
-    """One person followed across frames, with their own fallen-frame streak."""
-    __slots__ = ("id", "box", "streak", "misses")
+    """One person followed across frames, with their own fallen-frame streak
+    and the last few seconds of their poses (for fall analysis)."""
+    __slots__ = ("id", "box", "streak", "misses", "history")
 
     def __init__(self, track_id: int, box):
         self.id = track_id
         self.box = tuple(map(float, box))
         self.streak = 0   # consecutive fallen frames of THIS person, capped at CONSECUTIVE_FRAMES
         self.misses = 0   # consecutive frames this person was not detected
+        self.history = PoseHistory()  # ~5 s of this person's keypoints (fallanalysis.py)
 
     @property
     def confirmed(self) -> bool:
@@ -59,8 +62,10 @@ class PersonTracker:
         self.tracks: list[Track] = []
         self._next_id = 1
 
-    def update(self, boxes, fallen) -> list[Track]:
-        """Match this frame's detections; return the Track for each detection."""
+    def update(self, boxes, fallen, keypoints=None, states=None, timestamp=None) -> list[Track]:
+        """Match this frame's detections; return the Track for each detection.
+        With a timestamp (time.monotonic()), each matched person's keypoints and
+        posture state are also added to their pose history."""
         boxes = [tuple(map(float, box)) for box in boxes]
         candidates = []
         for ti, track in enumerate(self.tracks):
@@ -87,10 +92,16 @@ class PersonTracker:
             track.box = box
             track.misses = 0
             track.streak = min(track.streak + 1, CONSECUTIVE_FRAMES) if fallen[di] else 0
+            if timestamp is not None:
+                joints = keypoints[di] if keypoints is not None and di < len(keypoints) else None
+                state = states[di] if states is not None else ("fallen" if fallen[di] else "standing")
+                track.history.append(timestamp, box, joints, state)
         seen = {id(track) for track in assigned}
         for track in self.tracks:
             if id(track) not in seen:
                 track.misses += 1
+                if timestamp is not None:
+                    track.history.trim(timestamp)  # a missed frame is a gap, not a sample
         self.tracks = [track for track in self.tracks if track.misses <= TRACK_MAX_MISSES]
         return assigned
 
