@@ -138,6 +138,15 @@ class PoseHistory:
         # Fallback: a standing person's torso is roughly a third of their height.
         return float(np.median(heights)) / 3.0 if heights and np.median(heights) > 0 else None
 
+    def scale_source(self) -> str | None:
+        """Where body_scale() came from: 'standing' (reliable), 'lying' (a torso
+        lying towards the camera looks short), 'box' (a guess from height) or None."""
+        if any(s.torso and s.state == "standing" for s in self._samples):
+            return "standing"
+        if any(s.torso for s in self._samples):
+            return "lying"
+        return "box" if self.body_scale() else None
+
     def origin(self) -> np.ndarray | None:
         """Hip centre in the oldest sample that shows the hips (pixels)."""
         for sample in self._samples:
@@ -736,7 +745,8 @@ class PostFallWatch:
     __slots__ = ("confirmed_at", "last_t", "still_s", "longest_still_s", "moved", "last_move_t",
                  "critical_at", "moved_after_critical", "standing_since", "recovered_at",
                  "fall_hip_y", "scale", "above", "bystanders", "helpers", "helped_at",
-                 "nearby_since", "ever_nearby", "descent", "type_final", "pattern")
+                 "nearby_since", "ever_nearby", "descent", "type_final", "pattern",
+                 "scale_reliable", "bystander_debug", "announced")
 
     def __init__(self, t: float, history: PoseHistory):
         self.confirmed_at = self.last_t = t
@@ -751,6 +761,11 @@ class PostFallWatch:
         hips = joint_midpoint(latest.joints, HIPS) if latest is not None else None
         self.fall_hip_y = float(hips[1]) if hips is not None else None  # pixels, at confirmation
         self.scale = history.body_scale()
+        # A fallen person never seen standing is measured lying down; lying towards
+        # the camera, their torso looks short and is a poor ruler for distances.
+        self.scale_reliable = history.scale_source() == "standing"
+        self.bystander_debug: dict[int, str] = {}  # person ID -> why near / not near (console)
+        self.announced = False                     # analysis summary printed once
         self.above = 0  # consecutive frames over MOVE_THRESHOLD
         self.bystanders: dict[int, dict] = {}  # person ID -> first/current distance, times
         self.helpers: list[int] = []           # who has been with them, in order of arrival
@@ -812,10 +827,21 @@ class PostFallWatch:
         seen_now = {o[0] for o in others}
         for pid, box, torso, state in others:
             known = self.bystanders.get(pid)
-            if torso and max(torso, scale) / min(torso, scale) > DEPTH_RATIO:
-                continue  # much nearer to or farther from the camera: not really close
+            if self.scale_reliable:
+                unit = scale
+                if torso and max(torso, scale) / min(torso, scale) > DEPTH_RATIO:
+                    self.bystander_debug[pid] = (f"skipped: body size {max(torso, scale) / min(torso, scale):.1f}x "
+                                                 "different (different distance from the camera)")
+                    continue  # much nearer to or farther from the camera: not really close
+            else:
+                # The fallen person was never seen standing: measure in the other
+                # person's own torso lengths instead (their size is reliable when
+                # they are standing), and skip the depth check, which needs both.
+                unit = torso or scale
             bx, by = (box[0] + box[2]) / 2, box[3]
-            distance = float(np.hypot(bx - fx, by - fy)) / scale
+            distance = float(np.hypot(bx - fx, by - fy)) / unit
+            self.bystander_debug[pid] = (f"{distance:.1f} torso lengths away"
+                                         + (" (nearby)" if distance <= NEARBY_TORSOS else " (not nearby)"))
             if known is None and state != "standing":
                 # Kneeling down can change a helper's box so much that the tracker
                 # gives them a new ID: take over a bystander who just vanished here.
@@ -938,9 +964,41 @@ def watch_label(report: dict | None) -> str:
     status = report["status"]
     kind = report.get("fall_type")
     prefix = f" ({kind})" if kind in ("sudden", "gradual") else ""
+    if kind in ("sudden", "gradual") and report.get("pattern") == "unclear" and report.get("type_final"):
+        prefix = f" ({kind}, pattern unclear)"
     if report.get("pattern") in PATTERN_TEXT:
         prefix = f" ({VIDEO_LABEL.get(report['pattern'], report['pattern'])})"
+    elif kind == "unclear" and report.get("type_final"):
+        prefix = f" (type unclear: {SHORT_REASON.get(report.get('type_note', ''), 'see console')})"
     return prefix + _status_label(report, status)
+
+
+# Why a fall type is unclear, in a few ASCII words for the video label.
+SHORT_REASON = {
+    "too few frames with the hips visible": "hips not visible",
+    "body size unknown": "body not visible",
+    "not seen standing before the fall": "not seen standing first",
+    "the hips hardly dropped (sitting, or already low)": "hips hardly dropped",
+    "the start of the fall is not in view": "start not in view",
+    "too few frames during the fall (low frame rate)": "frame rate too low",
+}
+
+
+def watch_summary(person_id: int, watch: "PostFallWatch") -> str:
+    """One console line explaining what the analysis decided for a fallen person."""
+    report = watch.report(watch.last_t)
+    kind = report["fall_type"]
+    how = (f"{kind} ({report['descent_s']:.2f} s)" if report.get("descent_s") is not None
+           else f"unclear ({report.get('type_note') or 'no reason'})")
+    pattern = report.get("pattern")
+    if pattern:
+        signs = pattern_detail(report)
+        how += f", pattern {pattern}" + (f" [{signs}]" if signs else "")
+    scale = f"{watch.scale:.0f} px" if watch.scale else "unknown"
+    ruler = "standing frames" if watch.scale_reliable else "not seen standing: other people's own size"
+    others = "; ".join(f"#{pid} {text}" for pid, text in sorted(watch.bystander_debug.items())) or "nobody else seen"
+    return (f"[analysis] #{person_id}: {how}; priority {report['priority']}; "
+            f"body scale {scale} ({ruler}); others: {others}")
 
 
 def _status_label(report: dict, status: str) -> str:

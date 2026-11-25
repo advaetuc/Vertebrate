@@ -7,7 +7,11 @@ class CameraThread(QThread):
     # Annotated frame, alert (any person confirmed), leading person's streak (0..5),
     # leading person's ID (0 = none), people detected, IDs of confirmed people,
     # and {person ID: report} for everyone watched after a fall (fallanalysis.py).
-    frame_ready = Signal(QImage, bool, int, int, int, list, dict)
+    # The last one MUST be `object`, not `dict`: PySide6 turns a `dict` signal
+    # argument into a QVariantMap, which only allows text keys, so a dict keyed
+    # by person ID arrives EMPTY in the window (tests/test_frame_signal.py).
+    # A fresh dict is built for every frame, so passing the object is thread-safe.
+    frame_ready = Signal(QImage, bool, int, int, int, list, object)
     # Once a second: frames the detector processes per second, median model time
     # in ms, and how many frames a person's pose history holds at that rate.
     stats_ready = Signal(float, float, int)

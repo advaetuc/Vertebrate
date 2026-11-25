@@ -539,7 +539,7 @@ class MainWindow(QMainWindow):
         self.set_state("stopping")
         self.stop_timer.start()
 
-    @Slot(QImage, bool, int, int, int, list, dict)
+    @Slot(QImage, bool, int, int, int, list, object)  # must match CameraThread.frame_ready
     def show_frame(self, image, is_fallen, evidence, leader_id, people, confirmed_ids, aftermath):
         worker = self.sender()
         try:

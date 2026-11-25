@@ -295,6 +295,25 @@ measured in torso lengths (shoulders to hips), so a movement means the same
 whether the person is near or far from the camera. The fall analysis below
 (movement after a fall, people nearby, sudden vs gradual) is built on it.
 
+### Testing the fall analysis
+
+- **How they fell needs the fall itself.** Sudden/gradual, slip, trip and the
+  other patterns are measured while the person goes down, so they must be seen
+  **standing first and then falling** while monitoring is on. Someone already
+  lying when the camera starts gets `(type unclear: not seen standing first)`
+  on the video and "Fall type unclear" in alerts; people nearby are still
+  detected.
+- **Video labels say what was decided**: `(slip)`, `(sudden, pattern unclear)`,
+  `(type unclear: <reason>)`, and `- near #1` / `- going to #1` / `- with #1`
+  on other people.
+- **The terminal prints one line per fall** once its type is settled, e.g.
+  `[analysis] #1: sudden (0.52 s), pattern slip [...]; priority urgent; body
+  scale 91 px (standing frames); others: #2 3.1 torso lengths away (nearby)`.
+  Send this line when reporting a wrong label.
+- **Automated tests** (no camera needed), from the project folder:
+  `.venv/bin/python -m unittest discover -s tests -v` on macOS, or
+  `.venv\Scripts\python.exe -m unittest discover -s tests -v` on Windows.
+
 ## Workspace after cleanup
 
 ```text

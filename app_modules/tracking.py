@@ -1,7 +1,7 @@
 """Per-person tracking: follows each detected person so a fall is confirmed
 for ONE person, not across the whole scene. Pure NumPy, same on Windows and macOS."""
 from .common import *  # shared Qt imports, constants, and helpers
-from .fallanalysis import PoseHistory, PostFallWatch, torso_upright
+from .fallanalysis import PoseHistory, PostFallWatch, torso_upright, watch_summary
 
 # Per-person tracking -------------------------------------------------------
 # Detections are linked to people from frame to frame so a fall is confirmed for
@@ -136,6 +136,9 @@ class PersonTracker:
                 continue
             # People around them: everyone else seen in this frame
             track.watch.update_bystanders(t, track.box, [o for o in others_all if o[0] != track.id])
+            if track.watch.type_final and not track.watch.announced:
+                track.watch.announced = True  # once per fall: what was decided, and why
+                print(watch_summary(track.id, track.watch), file=sys.stderr, flush=True)
 
     def helper_ids(self) -> set[int]:
         """IDs of people near someone who fell, who came over standing."""

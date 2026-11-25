@@ -254,6 +254,29 @@ alarm and critical messages and the banner. Log fields added: `people_nearby`,
 mix keypoints, which may read as movement; helpers who were never seen standing
 are not recognised.
 
+### Hand-off of the analysis to the window (fix, 2026-11-25)
+
+`CameraThread.frame_ready` carries the per-person reports as its last argument,
+declared `object` (and `@Slot(..., list, object)` on `MainWindow.show_frame`).
+It was `dict`: PySide6 converts a `dict` signal argument to a QVariantMap, whose
+keys must be text, so the int-keyed reports arrived as `{}` (confirmed on
+PySide6 6.9.2 with a queued signal). The camera thread worked, but the window,
+fall log and Discord never received fall type, pattern, priority or people
+nearby. `tracker.aftermath()` builds a fresh dict each frame, so passing the
+object between threads is safe; never send internal mutable state through it.
+`tests/test_frame_signal.py` guards this with a real queued signal.
+
+Also: `PostFallWatch.scale_reliable` is True only when the fallen person's body
+scale came from standing frames (`PoseHistory.scale_source()`). Otherwise
+(already lying when first seen) bystander distances use the other person's own
+torso length and the 2x depth check is skipped, because a torso lying towards
+the camera is foreshortened. `watch_label()` shows `(type unclear: <reason>)`
+(`SHORT_REASON`) and `(sudden|gradual, pattern unclear)`. `watch_summary()` is
+printed to stderr once per fall when the type settles (`[analysis] ...`), with
+the reason for every other person being near or not (`bystander_debug`).
+`tests/test_fall_analysis.py` covers lying-from-start + bystander, lying towards
+the camera, and a timed sudden fall.
+
 ### Data architecture and state
 
 There is no application database or user record schema. The app does not save
