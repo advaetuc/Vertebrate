@@ -254,6 +254,18 @@ alarm and critical messages and the banner. Log fields added: `people_nearby`,
 mix keypoints, which may read as movement; helpers who were never seen standing
 are not recognised.
 
+### Clearing the fall log
+
+`FallLog.clear()` moves `runtime/logs/falls/<device>.csv` to
+`runtime/logs/falls/cleared/<device>-cleared-<YYYYmmdd-HHMMSS>.csv` (a rename,
+not a delete) and leaves `current` (an ongoing fall) untouched; it is written
+to a fresh file with a new header when it ends. `FallLogDialog.clear_log()`
+asks first (`_confirm_clear()`: QMessageBox, warning icon, "Clear log" as a
+destructive button, Cancel default and Escape), then emits `cleared`, which
+`MainWindow` connects to `log_changed()` (log button count, Falls today).
+The button is disabled when the log is empty. Tested in
+`tests/test_fall_log.py`.
+
 ### Hand-off of the analysis to the window (fix, 2026-11-25)
 
 `CameraThread.frame_ready` carries the per-person reports as its last argument,

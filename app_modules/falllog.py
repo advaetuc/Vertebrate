@@ -247,6 +247,26 @@ class FallLog:
             writer.writeheader()
             writer.writerows(old_rows)
 
+    def clear(self) -> Path | None:
+        """Clear the log: the file is moved to runtime/logs/falls/cleared/ as a
+        dated backup, so the list starts empty but nothing is lost by mistake.
+        An ongoing fall is kept and written to the fresh log when it ends.
+        Returns the backup's path, or None if there was nothing to clear or it
+        failed (then last_error says why)."""
+        if not self.path.exists():
+            return None
+        backup_dir = FALL_LOG_DIR / "cleared"
+        backup = backup_dir / f"{self.path.stem}-cleared-{datetime.now().strftime('%Y%m%d-%H%M%S')}.csv"
+        try:
+            backup_dir.mkdir(parents=True, exist_ok=True)
+            self.path.replace(backup)
+            self.last_error = None
+            return backup
+        except OSError as exc:
+            self.last_error = f"Could not clear the fall log: {exc}"
+            print(self.last_error, file=sys.stderr)
+            return None
+
     def rows(self) -> list[dict]:
         """Finished events for this device, newest first."""
         if not self.path.exists():

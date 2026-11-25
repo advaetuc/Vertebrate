@@ -127,6 +127,12 @@ history; a fall happening now appears live at the top. Each computer keeps its
 own file, `runtime/logs/falls/<device-name>.csv`, which opens in Excel or
 Numbers. No images or video are saved.
 
+**Clearing the log:** the Fall log window's **Clear log…** button removes all
+recorded falls from the list after you confirm (Cancel is the default). The old
+file is not deleted: it is moved to `runtime/logs/falls/cleared/` with the date
+and time in its name, so it can be restored by moving it back. A fall that is
+being detected at that moment is not affected and is logged when it ends.
+
 ### Emergency alarm
 
 In the sidebar's **Emergency alarm** card, set **Ring if fallen for** to the number of seconds a person may

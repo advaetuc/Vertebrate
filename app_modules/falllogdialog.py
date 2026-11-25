@@ -5,6 +5,7 @@ from .falllog import FallLog
 
 class FallLogDialog(QDialog):
     """Window listing this device's fall events; an ongoing fall is shown live on top."""
+    cleared = Signal()  # the log was cleared (the main window refreshes its counts)
     COLUMNS = ("Fall detected at", "Ended at", "Duration", "Person", "Priority", "Type", "After the fall", "Help",
                "Alarm", "Location", "Location source", "Ended by")
     LOCATION_COLUMN = 9
@@ -42,9 +43,13 @@ class FallLogDialog(QDialog):
         buttons = QHBoxLayout()
         folder = QPushButton("Open log file location")
         folder.clicked.connect(self.open_folder)
+        self.clear_button = QPushButton("Clear log…")
+        self.clear_button.setToolTip("Remove all recorded falls from this list (a backup copy is kept)")
+        self.clear_button.clicked.connect(self.clear_log)
         close = QPushButton("Close")
         close.clicked.connect(self.close)
         buttons.addWidget(folder)
+        buttons.addWidget(self.clear_button)
         buttons.addStretch()
         buttons.addWidget(close)
         layout.addLayout(buttons)
@@ -128,10 +133,40 @@ class FallLogDialog(QDialog):
             text += f" · alarm rang {alarms}× · total time in alert {format_duration(total)}"
         if self.log.current is not None:
             text += " · a fall is being detected now"
+        self.clear_button.setEnabled(bool(rows))
         text += f"\nFile: {self.log.path}"
         if self.log.last_error:
             text += f"\n{self.log.last_error}"
         self.summary.setText(text)
+
+    @Slot()
+    def clear_log(self):
+        count = len(self.log.rows())
+        if not count or not self._confirm_clear(count):
+            return
+        backup = self.log.clear()
+        self.refresh()
+        if backup is not None:
+            self.summary.setText(self.summary.text() + f"\nCleared. Backup: {backup}")
+        self.cleared.emit()
+
+    def _confirm_clear(self, count: int) -> bool:
+        """Ask before clearing; Cancel is the default button."""
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setWindowTitle("Clear fall log")
+        box.setText(f"Clear all {count} recorded fall{'s' if count != 1 else ''} from this log?")
+        details = ("The list will start empty. A backup copy is kept in "
+                   "runtime/logs/falls/cleared/ in case you need it later.")
+        if self.log.current is not None:
+            details += " The fall being detected now is not affected; it is logged when it ends."
+        box.setInformativeText(details)
+        clear = box.addButton("Clear log", QMessageBox.ButtonRole.DestructiveRole)
+        cancel = box.addButton(QMessageBox.StandardButton.Cancel)
+        box.setDefaultButton(cancel)
+        box.setEscapeButton(cancel)
+        box.exec()
+        return box.clickedButton() is clear
 
     @staticmethod
     def _location_fields(location):

@@ -760,6 +760,7 @@ class MainWindow(QMainWindow):
     def open_log(self):
         if self.log_dialog is None:
             self.log_dialog = FallLogDialog(self.fall_log, self)  # non-modal: video keeps running
+            self.log_dialog.cleared.connect(self.log_changed)       # update the button and "Falls today"
         self.log_dialog.show()
         self.log_dialog.raise_()
         self.log_dialog.activateWindow()
