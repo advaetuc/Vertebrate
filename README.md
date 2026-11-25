@@ -18,7 +18,7 @@ A focused webcam application that turns human pose geometry into visible fall-po
 ## One entry point. Two threads. A live view.
 
 `app.py` starts the application; implementation is organized under `app_modules/` so each class and shared helper can be found directly. The runtime behavior and interface are unchanged. `app.py` provides a dark control-room interface: green/red skeleton overlays
-on a live view, a status sidebar (fall-evidence meter, people in view, frame
+on a live view, a status sidebar (urgency meter, people in view, frame
 rate, falls today, location, alarm setting), a live location/time watermark,
 and banners that escalate from **Fall detected** to a pulsing **Emergency
 alarm**. It looks the same on Windows and macOS. Inference runs
@@ -33,7 +33,7 @@ the only optional network use is a text alert to caregivers on Discord.
 - `app_modules/caregivers.py` — optional Discord caregiver alerts: sender, message format and setup window.
 - `app_modules/tracking.py` — per-person tracking (`PersonTracker`): IDs and each person's 5-frame fall check.
 - `app_modules/fallanalysis.py` — fall analysis: each person's last 8 s of keypoints (`PoseHistory`, measured in torso lengths so near and far people compare) and the detector's real frame rate (`FrameRateMeter`), movement after a fall, people around, sudden vs gradual and the priority of each fall.
-- `app_modules/falllogdialog.py` and the UI component modules (`videoview.py`, `evidencemeter.py`, `stattile.py`, `logomark.py`) — focused behavior and widgets.
+- `app_modules/falllogdialog.py` and the UI component modules (`videoview.py`, `urgencymeter.py`, `stattile.py`, `logomark.py`) — focused behavior and widgets.
 - `app_modules/common.py` — shared settings, constants, Qt imports, and helper functions.
 
 ```mermaid
@@ -294,6 +294,16 @@ Each tracked person also keeps their last 8 seconds of keypoints. Positions are
 measured in torso lengths (shoulders to hips), so a movement means the same
 whether the person is near or far from the camera. The fall analysis below
 (movement after a fall, people nearby, sudden vs gradual) is built on it.
+
+### Urgency meter
+
+The sidebar's **Urgency** card shows how urgent the ongoing fall is: three
+segments — Check, Urgent, Critical — filled in the same colour as the banner
+and the Discord alerts, with who it is and why (e.g. `CRITICAL · #2` / "No
+movement for 18 s", `URGENT · #1` / "Possible slip: fell backwards or onto the
+hips"). It turns green when the person gets up. Before a fall is confirmed it
+reads "Possible fall · #2 · 3 of 5 frames", so the five-frame confirmation is
+still visible.
 
 ### Testing the fall analysis
 

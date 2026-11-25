@@ -82,7 +82,7 @@ microservice, or cloud-processing tier.
 | Annotation | `annotate()` | Current mutable frame only |
 | Per-person tracking | `tracking.py`: `PersonTracker`, `Track`, `box_iou()`, `center_shift()` | IDs, per-person streaks, worker-owned |
 | Camera/inference | `CameraThread.run()` | Capture, model, tracker, pending-frame event |
-| Desktop UI | `MainWindow`, `VideoView`, `EvidenceMeter`, `StatTile` | UI state, timers, worker lifecycle |
+| Desktop UI | `MainWindow`, `VideoView`, `UrgencyMeter`, `StatTile` | UI state, timers, worker lifecycle |
 
 The model and camera are constructed in `CameraThread.run()`. The camera is
 released in that worker's `finally` block. Stop uses `requestInterruption()`
@@ -336,9 +336,12 @@ platform UI font, with the fixed-width system font for numbers.
   live view (`VideoView`: rounded, state-coloured border, LIVE tag,
   placeholder with a camera glyph when off), and Start monitoring / Stop /
   Fall log buttons.
-- **Sidebar (scrolls on small windows):** Status card (tinted by state), Fall
-  evidence meter (the leading person's five-frame streak and ID, sent by the
-  worker; each box on the video is labelled with its person ID), Live stats (people in view, frames per second, falls
+- **Sidebar (scrolls on small windows):** Status card (tinted by state), Urgency
+  meter (`UrgencyMeter`: Check / Urgent / Critical segments in the
+  `PRIORITY_STYLE` colour of `FallLog.priority_now()`, green when recovered,
+  with who and why from `MainWindow.refresh_urgency()`; before confirmation it
+  shows the leading person's five-frame streak as "Possible fall · #2 · 3 of 5
+  frames"; each box on the video is labelled with its person ID), Live stats (people in view, frames per second, falls
   today, alarm countdown), Location, and the Emergency alarm setting.
 
 `MainWindow.set_state()` drives everything from one state: idle, starting,

@@ -5,7 +5,6 @@ from .camerathread import CameraThread
 from .caregivers import (
     CaregiverDialog, DiscordNotifier, caregiver_config_problem, caregiver_embed,
 )
-from .evidencemeter import EvidenceMeter
 from .fallanalysis import (HISTORY_SECONDS, PATTERN_TEXT, PRIORITY_STYLE, TYPE_SETTLE_S, fall_type_text,
                            pattern_detail)
 from .falllog import FallLog
@@ -13,6 +12,7 @@ from .falllogdialog import FallLogDialog
 from .locationfeed import LocationFeed
 from .logomark import LogoMark
 from .stattile import StatTile
+from .urgencymeter import UrgencyMeter
 from .videoview import VideoView
 
 class MainWindow(QMainWindow):
@@ -27,6 +27,7 @@ class MainWindow(QMainWindow):
         self._flash = False
         self._people = 0
         self._leader_id = 0  # person closest to a confirmed fall (0 = none)
+        self._evidence = 0   # that person's fallen-posture frames so far (0..CONSECUTIVE_FRAMES)
         self._aftermath = {}  # {person ID: post-fall report} from the camera thread
         self._start_pending = None  # monotonic time a fall started; its first Discord alert waits
                                     # (up to TYPE_SETTLE_S) until sudden/gradual is measured
@@ -208,15 +209,21 @@ class MainWindow(QMainWindow):
         status.addWidget(self.status_detail)
         column.addWidget(self.status_card)
 
-        card, layout = self._card("Fall evidence")
-        self.meter = EvidenceMeter()
+        card, layout = self._card("Urgency")
+        self.meter = UrgencyMeter()
         layout.addWidget(self.meter)
-        row = QHBoxLayout()
-        self.evidence_label = make_label(f"0 of {CONSECUTIVE_FRAMES} frames", 13, QFont.Weight.DemiBold, mono=True)
-        row.addWidget(self.evidence_label)
-        row.addStretch()
-        row.addWidget(make_label(f"{CONSECUTIVE_FRAMES} in a row, same person", 12, obj="muted"))
-        layout.addLayout(row)
+        scale = QHBoxLayout()
+        scale.setContentsMargins(0, 0, 0, 0)
+        for word, align in (("Check", Qt.AlignmentFlag.AlignLeft), ("Urgent", Qt.AlignmentFlag.AlignHCenter),
+                            ("Critical", Qt.AlignmentFlag.AlignRight)):
+            label = make_label(word, 11, obj="muted")
+            label.setAlignment(align)
+            scale.addWidget(label, 1)
+        layout.addLayout(scale)
+        self.urgency_label = make_label("—", 13, QFont.Weight.DemiBold, mono=True)
+        layout.addWidget(self.urgency_label)
+        self.urgency_reason = make_label("Starts with monitoring.", 12, obj="muted", wrap=True)
+        layout.addWidget(self.urgency_reason)
         column.addWidget(card)
 
         card, layout = self._card("Live stats")
@@ -469,10 +476,52 @@ class MainWindow(QMainWindow):
             self.stat_alarm.set(f"{self._alarm_remaining()} s", WARN)
         else:
             self.stat_alarm.set(f"{delay} s")
-        if self._leader_id and self.meter.value:
-            self.evidence_label.setText(f"#{self._leader_id} · {self.meter.value} of {CONSECUTIVE_FRAMES}")
+        self.refresh_urgency(running)
+
+    def refresh_urgency(self, running: bool) -> None:
+        """Urgency card: the ongoing fall's priority and why; before a fall is
+        confirmed, how close the leading person is to confirmation."""
+        current = self.fall_log.current
+        if current is None:
+            self.meter.set_priority(None)
+            if not running:
+                text, reason, tone = "—", "Starts with monitoring.", None
+            elif self._evidence:
+                who = f" · #{self._leader_id}" if self._leader_id else ""
+                text = f"Possible fall{who} · {self._evidence} of {CONSECUTIVE_FRAMES} frames"
+                reason, tone = f"A fall is confirmed after {CONSECUTIVE_FRAMES} frames in a row of the same person.", AMBER
+            else:
+                text, reason, tone = "All clear", "No fall in progress.", OK
         else:
-            self.evidence_label.setText(f"{self.meter.value} of {CONSECUTIVE_FRAMES} frames")
+            priority = self.fall_log.priority_now()
+            self.meter.set_priority(priority)
+            word, tone = PRIORITY_STYLE[priority][1], PRIORITY_STYLE[priority][3]
+            who = ", ".join(f"#{i}" for i in sorted(current["people"]))
+            text = f"{word} · {who}" if who else word
+            reason = self._urgency_reason(priority)
+        self.urgency_label.setText(text)
+        self.urgency_label.setStyleSheet(f"color: {tone};" if tone else "")
+        self.urgency_reason.setText(reason)
+
+    def _urgency_reason(self, priority: str) -> str:
+        """Why the ongoing fall has its priority, in a few words."""
+        report = self._first_report()
+        still = self.fall_log.still_people()
+        if priority == "recovered" or report.get("status") == "recovered":
+            return "Got up."
+        if still:
+            seconds = max((self._aftermath.get(pid, {}).get("still_s", 0) for pid in still), default=0)
+            return f"No movement for {format_duration(seconds)}."
+        if report.get("pattern") in PATTERN_TEXT:
+            label, meaning = PATTERN_TEXT[report["pattern"]]
+            return f"{label}: {meaning}."
+        if not report:
+            return "Fall confirmed."
+        if not report.get("type_final"):
+            return "Fall confirmed. Measuring how they fell…"
+        if report.get("fall_type") in ("sudden", "gradual"):
+            return fall_type_text(report) + "."
+        return "Fall type unclear: " + (report.get("type_note") or "not measured") + "."
 
     def refresh_location(self) -> None:
         fix = self.location.current_fix()
@@ -514,7 +563,8 @@ class MainWindow(QMainWindow):
         self._leader_id = 0
         self._start_pending = None
         self._aftermath = {}
-        self.meter.set_value(0)
+        self._evidence = 0
+        self.meter.set_priority(None)
         self.start_button.setEnabled(False)
         self.stop_button.setEnabled(True)
         self.video.show_message("Starting camera…", "Loading the pose model. This takes a few seconds.")
@@ -551,7 +601,7 @@ class MainWindow(QMainWindow):
             self._people = people
             self._leader_id = leader_id
             self._aftermath = aftermath
-            self.meter.set_value(evidence)
+            self._evidence = evidence
             was_falling = self.fall_log.current is not None
             if self.fall_log.update(is_fallen, self.location.current_fix(), confirmed_ids):
                 self.log_changed()
@@ -627,7 +677,8 @@ class MainWindow(QMainWindow):
         self._aftermath = {}
         self._frame_times.clear()
         self._detect_fps = None
-        self.meter.set_value(0)
+        self._evidence = 0
+        self.meter.set_priority(None)
         self.start_button.setEnabled(True)
         self.stop_button.setEnabled(False)
         if self._error:
