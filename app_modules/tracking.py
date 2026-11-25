@@ -1,7 +1,7 @@
 """Per-person tracking: follows each detected person so a fall is confirmed
 for ONE person, not across the whole scene. Pure NumPy, same on Windows and macOS."""
 from .common import *  # shared Qt imports, constants, and helpers
-from .fallanalysis import PoseHistory, PostFallWatch
+from .fallanalysis import PoseHistory, PostFallWatch, torso_upright
 
 # Per-person tracking -------------------------------------------------------
 # Detections are linked to people from frame to frame so a fall is confirmed for
@@ -33,7 +33,7 @@ def center_shift(a, b) -> float:
 class Track:
     """One person followed across frames, with their own fallen-frame streak
     and the last few seconds of their poses (for fall analysis)."""
-    __slots__ = ("id", "box", "streak", "misses", "history", "watch")
+    __slots__ = ("id", "box", "streak", "misses", "history", "watch", "helping")
 
     def __init__(self, track_id: int, box):
         self.id = track_id
@@ -42,6 +42,7 @@ class Track:
         self.misses = 0   # consecutive frames this person was not detected
         self.history = PoseHistory()  # ~5 s of this person's keypoints (fallanalysis.py)
         self.watch: PostFallWatch | None = None  # what they do after a confirmed fall
+        self.helping = False  # kneeling/crouching beside someone who fell (not a fall)
 
     @property
     def confirmed(self) -> bool:
@@ -68,6 +69,7 @@ class PersonTracker:
         With a timestamp (time.monotonic()), each matched person's keypoints and
         posture state are also added to their pose history."""
         boxes = [tuple(map(float, box)) for box in boxes]
+        helpers = self.helper_ids()  # people helping someone who fell (previous frame)
         candidates = []
         for ti, track in enumerate(self.tracks):
             for di, box in enumerate(boxes):
@@ -92,7 +94,14 @@ class PersonTracker:
                 assigned[di] = track
             track.box = box
             track.misses = 0
-            track.streak = min(track.streak + 1, CONSECUTIVE_FRAMES) if fallen[di] else 0
+            # A helper kneeling or crouching beside someone who fell is not a new
+            # fall -- but only while their torso stays upright: a helper who
+            # collapses and ends up lying down is counted as usual.
+            joints = keypoints[di] if keypoints is not None and di < len(keypoints) else None
+            track.helping = bool(fallen[di] and track.id in helpers and not track.confirmed
+                                 and torso_upright(joints))
+            counts = fallen[di] and not track.helping
+            track.streak = min(track.streak + 1, CONSECUTIVE_FRAMES) if counts else 0
             if timestamp is not None:
                 joints = keypoints[di] if keypoints is not None and di < len(keypoints) else None
                 state = states[di] if states is not None else ("fallen" if fallen[di] else "standing")
@@ -110,7 +119,11 @@ class PersonTracker:
 
     def _update_watches(self, t: float, seen: set) -> None:
         """Start watching a person when their fall is confirmed (again, if they
-        had got up), and follow what they do until they get up."""
+        had got up), and follow what they do until they get up, and who else
+        is around them."""
+        others_all = [(track.id, track.box, track.history.body_scale(), track.history.latest.state)
+                      for track in self.tracks
+                      if id(track) in seen and track.history.latest is not None and track.history.latest.t == t]
         for track in self.tracks:
             if track.confirmed and (track.watch is None or track.watch.recovered_at is not None):
                 track.watch = PostFallWatch(t, track.history)
@@ -118,6 +131,19 @@ class PersonTracker:
                 track.watch.update(t, track.history, id(track) in seen)
                 if track.watch.expired(t):
                     track.watch = None
+                    continue
+            else:
+                continue
+            # People around them: everyone else seen in this frame
+            track.watch.update_bystanders(t, track.box, [o for o in others_all if o[0] != track.id])
+
+    def helper_ids(self) -> set[int]:
+        """IDs of people near someone who fell, who came over standing."""
+        ids = set()
+        for track in self.tracks:
+            if track.watch is not None:
+                ids |= track.watch.helper_ids(track.watch.last_t)
+        return ids
 
     def aftermath(self) -> dict:
         """{person ID: report} for everyone being watched after a fall."""

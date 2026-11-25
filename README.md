@@ -192,6 +192,29 @@ no-movement alert — and the Fall log window shows *After the fall*. Older logs
 are upgraded automatically. This is camera analysis, not a medical diagnosis;
 the siren still follows the alarm delay you set.
 
+### People around a fallen person
+
+While someone is down, Vertebrate also looks at everyone else in view:
+
+- **Nearby** — within about two body lengths (measured on the floor, in the
+  fallen person's own body size). Someone much nearer to or farther from the
+  camera, who only *looks* close in the picture, is not counted.
+- **Coming over** — getting at least one torso length closer within 2 seconds.
+- **With them** — within arm's reach for 2 seconds.
+
+The first Discord alert says who is around ("2 people nearby (#1, #3)" or
+"Nobody else nearby"). When someone reaches them, caregivers get a 🟡 "Someone
+is with them" update. If people stay nearby for **20 seconds** and nobody goes
+over, a 🟠 "Nobody has responded" alert follows, with a ping — bystanders may not
+have noticed. Bystanders **never cancel** an alert or the alarm. The video
+labels show `- going to #2`, `- with #2` or `- near #2`.
+
+A helper kneeling or crouching beside the person is labelled **Helping** and
+is not reported as a second fall, as long as their upper body stays upright;
+if they collapse and end up lying down, their fall is detected as usual. The
+fall log's new *Help* column shows, for example, "#1 with them after 6 s" or
+"#4 nearby, nobody came".
+
 ### Frame rate and pose history
 
 The **Frames / second** tile shows how many frames the detector actually

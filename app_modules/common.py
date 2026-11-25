@@ -123,6 +123,7 @@ LOG_FIELDS = (
     "latitude", "longitude", "accuracy_m", "location_source", "ended_by",
     "alarm_after_seconds", "alarm_rang_at", "alarm_silenced_at", "person_ids",
     "after_fall", "longest_still_seconds", "no_movement_alert_at",
+    "people_nearby", "helped_by", "help_after_seconds",
 )
 
 ALARM_DEFAULT_S = 30
@@ -207,6 +208,11 @@ def watch_label(report) -> str:
     from .fallanalysis import watch_label as label  # fallanalysis imports this module
     return label(report)
 
+def bystander_label(fallen_reports, person_id) -> str:
+    """Label suffix for a helper (see fallanalysis.py)."""
+    from .fallanalysis import bystander_label as label  # fallanalysis imports this module
+    return label(fallen_reports, person_id)
+
 def annotate(frame, result, tracker, timestamp=None):
     """Paint this result onto its own frame and update per-person confirmation.
     `tracker` is a tracking.PersonTracker (worker thread only). With a
@@ -220,9 +226,11 @@ def annotate(frame, result, tracker, timestamp=None):
     states = [posture_state(box, joints, frame_w, frame_h) for box, joints in zip(boxes, joints_list)]
     fallen = [state == "fallen" for state in states]  # "too close" never counts towards a fall
     tracks = tracker.update(boxes, fallen, joints_list, states, timestamp)
+    fallen_reports = tracker.aftermath() if hasattr(tracker, "aftermath") else {}
     for box, joints, state, track in zip(boxes, joints_list, states, tracks):
         is_fallen = state == "fallen"
-        color = RED if is_fallen else TOO_CLOSE_BGR if state == "too_close" else GREEN
+        helping = is_fallen and getattr(track, "helping", False)  # kneeling beside someone who fell
+        color = GREEN if helping else RED if is_fallen else TOO_CLOSE_BGR if state == "too_close" else GREEN
         thickness = 4 if track.confirmed else 2
         x1, y1, x2, y2 = map(int, box)
         cv2.rectangle(frame, (x1, y1), (x2, y2), color, thickness)
@@ -231,12 +239,14 @@ def annotate(frame, result, tracker, timestamp=None):
             text = f"#{track.id} FALL CONFIRMED" + watch_label(watch)
         elif watch and watch["status"] == "recovered":
             text = f"#{track.id} Got up"
+        elif helping:
+            text = f"#{track.id} Helping" + bystander_label(fallen_reports, track.id)
         elif is_fallen:
             text = f"#{track.id} Fallen posture {track.streak}/{CONSECUTIVE_FRAMES}"
         elif state == "too_close":
             text = f"#{track.id} Too close to camera"
         else:
-            text = f"#{track.id} Standing"
+            text = f"#{track.id} Standing" + bystander_label(fallen_reports, track.id)
         cv2.putText(frame, text, (x1, max(22, y1 - 8)), cv2.FONT_HERSHEY_SIMPLEX, .6, color, 2, cv2.LINE_AA)
         if joints is None:
             continue

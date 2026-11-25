@@ -154,6 +154,32 @@ synthetic poses with keypoint wobble (still person far away: worst score 0.14),
 not yet on real footage; tune them in `fallanalysis.py`. Video labels must stay
 ASCII (OpenCV's Hershey font).
 
+### People around a fallen person (phase 2)
+
+`PostFallWatch.update_bystanders()` runs each frame for every watched (not
+recovered) person, with every other person seen in that frame. Distance =
+floor point to floor point (bottom centre of each box) divided by the fallen
+person's torso length; torso sizes differing more than 2× (different depth)
+are skipped. A new bystander must be `standing` when first seen. Nearby ≤ 6,
+with them ≤ 2.5 for ≥ 2 s (recorded in `helpers` with `helped_at`), coming
+over = distance dropped ≥ 1 within 2 s. `no_response` = someone nearby for
+≥ 20 s since first nearby, nobody with them and nobody coming over. When a
+kneeling helper gets a new tracker ID (box shape change), a non-standing new
+person within 1.5 torso lengths of where a bystander vanished ≤ 1.5 s ago takes
+over that entry. `PersonTracker.helper_ids()` = bystanders currently nearby;
+in `update()`, such a person's fallen posture does not grow their streak while
+`torso_upright()` (shoulder→hip line within ~45° of vertical) — `Track.helping`,
+labelled "Helping" in green. A helper lying down counts as a fall. Reports add
+`nearby`, `with_them`, `approaching`, `helpers`, `help_after_s`, `ever_nearby`,
+`no_response`. `FallLog.note_aftermath()` returns `helper` / `no_response` once
+per event; `MainWindow` sends "Someone is with them" (no ping) and "Nobody has
+responded" (ping) as `fall` messages, and adds the help sentence to the fall,
+alarm and critical messages and the banner. Log fields added: `people_nearby`,
+`helped_by`, `help_after_seconds`; Fall log window column "Help". Known limits:
+2D image only (depth guessed from body size); a helper touching the person can
+mix keypoints, which may read as movement; helpers who were never seen standing
+are not recognised.
+
 ### Data architecture and state
 
 There is no application database or user record schema. The app does not save
@@ -166,7 +192,7 @@ log CSV (see "Fall log" below).
 | Model result | One inference iteration | Boxes and `keypoints.xy` only |
 | Person tracks | Worker session | ID, last box, streak (cap 5), missed frames; dropped after 15 misses |
 | Pose history | Worker session, per track | Last 5 s of keypoints (NaN = not visible), box and posture state; `fallanalysis.PoseHistory`, read in torso lengths |
-| Post-fall watch | Worker session, per track | `Track.watch` (`PostFallWatch`): moving / still / got up after a confirmed fall; reported each frame |
+| Post-fall watch | Worker session, per track | `Track.watch` (`PostFallWatch`): moving / still / got up after a confirmed fall, plus bystanders (nearby / coming over / with them); reported each frame |
 | Frame rate | Worker session | `FrameRateMeter`: detector frames/s, model ms; `stats_ready` signal once a second |
 | Performance log | `runtime/logs/performance/<device>.csv` | One row per camera session: median/slowest fps, model ms, frame size, system; ignored by Git |
 | Display image | One pending signal | RGB QImage detached with `copy()` |

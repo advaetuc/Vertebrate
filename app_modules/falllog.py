@@ -9,7 +9,8 @@ class FallLog:
     END_GRACE_S (end time = when it first went off), or when the camera stops.
     person_ids lists who was confirmed; IDs restart with each camera session.
     What the person did afterwards (moved, lay still, got up) is recorded from
-    the camera thread's post-fall reports (note_aftermath). One row is appended
+    the camera thread's post-fall reports (note_aftermath), with who else was
+    nearby and who came to help. One row is appended
     per finished event. The file lives in runtime/logs/falls/<device>.csv and
     opens directly in Excel or Numbers.
     """
@@ -34,7 +35,8 @@ class FallLog:
                                 "alarm_after": None, "alarm_rang": None, "alarm_silenced": None,
                                 "moved": False, "longest_still": 0.0, "critical_at": None,
                                 "critical_ids": set(), "moved_again": False, "recovered": {},
-                                "still_now": {}}
+                                "still_now": {}, "nearby": set(), "helpers": [], "help_after": None,
+                                "no_response": False}
                 return True
             self.current["people"].update(person_ids)  # someone else may fall during the event
             if self.current["location"] is None and location is not None:
@@ -53,8 +55,10 @@ class FallLog:
     def note_aftermath(self, aftermath: dict) -> list[str]:
         """Record the camera thread's post-fall reports ({person ID: report}) for
         the people in the ongoing event. Returns what changed for alerts:
-        'critical' the first time someone lies still for STILL_CRITICAL_S, and
-        'moving_again' the first time a still person moves afterwards."""
+        'critical' the first time someone lies still for STILL_CRITICAL_S,
+        'moving_again' the first time a still person moves afterwards,
+        'helper' the first time someone is with a fallen person, and
+        'no_response' when people were nearby for a while but nobody came."""
         event = self.current
         if event is None:
             return []
@@ -75,6 +79,16 @@ class FallLog:
             if report["moved_after_critical"] and not event["moved_again"]:
                 event["moved_again"] = True
                 changes.append("moving_again")
+            event["nearby"].update(i for i in report.get("ever_nearby", ()) if i not in event["people"])
+            for helper in report.get("helpers", ()):
+                if helper not in event["helpers"] and helper not in event["people"]:
+                    event["helpers"].append(helper)
+                    if event["help_after"] is None:
+                        event["help_after"] = report.get("help_after_s")
+                        changes.append("helper")
+            if report.get("no_response") and not event["no_response"] and not event["helpers"]:
+                event["no_response"] = True
+                changes.append("no_response")
         return changes
 
     def still_people(self) -> list[int]:
@@ -129,6 +143,9 @@ class FallLog:
             "after_fall": self.after_fall_text(event),
             "longest_still_seconds": f"{event['longest_still']:.0f}",
             "no_movement_alert_at": stamp(event["critical_at"]),
+            "people_nearby": ";".join(str(i) for i in sorted(event["nearby"])),
+            "helped_by": ";".join(str(i) for i in event["helpers"]),
+            "help_after_seconds": f"{event['help_after']:.0f}" if event["help_after"] is not None else "",
         }
         self.last_finished = {**row, "location": location, "seconds": seconds, "people": sorted(event["people"])}
         try:
@@ -158,6 +175,18 @@ class FallLog:
         if event["moved"]:
             return "Moved"
         return "Not judged"
+
+    @staticmethod
+    def help_text(row: dict) -> str:
+        """For a log row: '#1 with them after 12 s', '#1, #3 nearby — nobody came', 'Nobody nearby'."""
+        ids = lambda key: [f"#{i}" for i in (row.get(key) or "").split(";") if i]
+        helpers, nearby = ids("helped_by"), ids("people_nearby")
+        if helpers:
+            after = row.get("help_after_seconds")
+            return ", ".join(helpers) + " with them" + (f" after {format_duration(float(after))}" if after else "")
+        if nearby:
+            return ", ".join(nearby) + " nearby, nobody came"
+        return "Nobody nearby" if row.get("after_fall") else "—"  # older rows: not recorded
 
     def _upgrade_header(self) -> None:
         """Rewrite a log made by an older version so its columns match LOG_FIELDS."""

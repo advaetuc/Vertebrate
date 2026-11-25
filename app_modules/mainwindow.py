@@ -332,7 +332,34 @@ class MainWindow(QMainWindow):
                 parts.append(f"#{pid} moving")
             elif report["status"] == "recovered":
                 parts.append(f"#{pid} got up")
-        return (", ".join(parts) + ".") if parts else ""
+        text = (", ".join(parts) + ".") if parts else ""
+        help_text = self._help_text()
+        return f"{text} {help_text}".strip()
+
+    def _help_text(self) -> str:
+        """Who is around the people in the ongoing fall: '#1 is with them.',
+        '#3 is coming over.', '2 people nearby (#1, #3).', 'Nobody else nearby.'"""
+        current = self.fall_log.current
+        if current is None:
+            return ""
+        reports = [self._aftermath[pid] for pid in sorted(current["people"]) if pid in self._aftermath]
+        if not reports:
+            return ""
+        def ids(key):
+            found = sorted({i for r in reports for i in r.get(key, ()) if i not in current["people"]})
+            return found, ", ".join(f"#{i}" for i in found)
+        with_them, with_text = ids("with_them")
+        coming, coming_text = ids("approaching")
+        nearby, nearby_text = ids("nearby")
+        if with_them:
+            return f"{with_text} {'is' if len(with_them) == 1 else 'are'} with them."
+        if coming:
+            return f"{coming_text} {'is' if len(coming) == 1 else 'are'} coming over."
+        if nearby:
+            if current["no_response"]:
+                return f"{nearby_text} nearby but nobody has gone to them."
+            return f"{len(nearby)} {'person' if len(nearby) == 1 else 'people'} nearby ({nearby_text})."
+        return "Nobody else nearby."
 
     def _alarm_remaining(self) -> int:
         return max(0, int(self.alarm_delay.value() - self.fall_log.ongoing_seconds() + 0.999))
@@ -530,6 +557,11 @@ class MainWindow(QMainWindow):
                     self.log_changed()
                 elif change == "moving_again":
                     self.notify_moving_again()
+                elif change == "helper":
+                    self.notify_helper()
+                    self.log_changed()
+                elif change == "no_response":
+                    self.notify_no_response()
             self.check_alarm()
             # An ongoing fall event (including its 2 s grace) keeps the fall state,
             # so the banner does not flicker on single missed frames.
@@ -682,9 +714,11 @@ class MainWindow(QMainWindow):
         when = current["start"].strftime("%H:%M:%S on %d %b %Y")
         follow = (f"The alarm will ring in {format_duration(delay)} if they stay down." if delay
                   else "The alarm on the device is off.")
+        help_text = self._help_text()
         self._send_caregiver(
             "fall", f"⚠️ Fall detected — {self._who()}",
-            f"A fall was detected on **{self.fall_log.device}** at {when}. {follow}",
+            f"A fall was detected on **{self.fall_log.device}** at {when}. "
+            + (f"**{help_text}** " if help_text else "") + follow,
             current["location"], mention=True)
 
     def notify_alarm(self) -> None:
@@ -694,7 +728,8 @@ class MainWindow(QMainWindow):
         self._send_caregiver(
             "alarm", f"🚨 EMERGENCY — {self._who()} still down",
             f"Down for **{format_duration(self.fall_log.ongoing_seconds())}** on **{self.fall_log.device}**. "
-            "The siren is ringing. Please check on them now.",
+            + (f"{self._help_text()} " if self._help_text() else "")
+            + "The siren is ringing. Please check on them now.",
             current["location"], mention=True)
 
     def notify_no_movement(self) -> None:
@@ -707,7 +742,8 @@ class MainWindow(QMainWindow):
             "critical", f"🔴 CRITICAL — {people_text(still)} not moving",
             f"{people_text(still)} fell and has **not moved for {format_duration(report.get('still_s', 0))}** "
             f"on **{self.fall_log.device}** (down for {format_duration(self.fall_log.ongoing_seconds())}). "
-            "They may be unconscious. Please check on them immediately or call emergency services.",
+            "They may be unconscious. " + (f"**{self._help_text()}** " if self._help_text() else "")
+            + "Please check on them immediately or call emergency services.",
             current["location"], mention=True,
             extra_fields=[{"name": "Note", "value": "Movement judged from camera analysis — not a medical "
                                                      "diagnosis.", "inline": False}])
@@ -722,6 +758,32 @@ class MainWindow(QMainWindow):
             f"but is still down ({format_duration(self.fall_log.ongoing_seconds())}). Please still check on them.",
             current["location"], mention=False)
 
+    def notify_helper(self) -> None:
+        current = self.fall_log.current
+        if current is None or not current["helpers"]:
+            return
+        helper = f"#{current['helpers'][0]}"
+        after = current["help_after"]
+        self._send_caregiver(
+            "fall", f"🟡 Someone is with them — {self._who()}",
+            f"Person {helper} reached {self._who().lower()} on **{self.fall_log.device}**"
+            + (f" {format_duration(after)} after the fall" if after is not None else "")
+            + ". The alert stays on until they are back on their feet.",
+            current["location"], mention=False)
+
+    def notify_no_response(self) -> None:
+        current = self.fall_log.current
+        if current is None:
+            return
+        nearby = ", ".join(f"#{i}" for i in sorted(current["nearby"]))
+        self._send_caregiver(
+            "fall", f"🟠 Nobody has responded — {self._who()}",
+            f"{nearby or 'People'} {'has' if len(current['nearby']) == 1 else 'have'} been near "
+            f"{self._who().lower()} on **{self.fall_log.device}** but nobody has gone to them "
+            f"(down for {format_duration(self.fall_log.ongoing_seconds())}). They may not have noticed — "
+            "please check on them.",
+            current["location"], mention=True)
+
     def notify_fall_ended(self) -> None:
         row = self.fall_log.last_finished
         if row is None:
@@ -735,6 +797,7 @@ class MainWindow(QMainWindow):
             extra.append({"name": "Alarm", "value": alarm, "inline": True})
         if row.get("after_fall"):
             extra.append({"name": "After the fall", "value": row["after_fall"], "inline": True})
+            extra.append({"name": "Help", "value": FallLog.help_text(row), "inline": True})
         if row["ended_by"] == "Got up":
             self._send_caregiver(
                 "end", f"🟢 Recovered — {people_text(row.get('people', []))} got up",

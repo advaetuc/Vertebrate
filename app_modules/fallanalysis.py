@@ -1,7 +1,8 @@
 """Fall analysis: per-person pose history and frame-rate measurement (phase 0),
-and the watch after a confirmed fall: is the person moving, lying still, or
-back on their feet? (phase 1). Later phases (bystanders, sudden vs gradual,
-fall patterns) build on the same history.
+the watch after a confirmed fall: is the person moving, lying still, or
+back on their feet? (phase 1), and who else is around them: nearby, coming
+over, or already with them (phase 2). Later phases (sudden vs gradual, fall
+patterns) build on the same history.
 Pure Python + NumPy, same on Windows and macOS. Worker thread only."""
 from .common import *  # shared Qt imports, constants, and helpers
 import warnings
@@ -51,6 +52,21 @@ def torso_length(joints: np.ndarray) -> float | None:
         return None
     length = float(np.hypot(*(shoulders - hips)))
     return length if length >= MIN_TORSO_PX else None
+
+
+UPRIGHT_MIN = 0.7  # vertical share of the shoulder-to-hip line for an upright torso (~45°)
+
+
+def torso_upright(keypoints) -> bool:
+    """Shoulders clearly above hips: kneeling, crouching, sitting or standing,
+    as opposed to lying. False when shoulders or hips are not visible."""
+    joints = visible_joints(keypoints)
+    shoulders, hips = joint_midpoint(joints, SHOULDERS), joint_midpoint(joints, HIPS)
+    if shoulders is None or hips is None:
+        return False
+    dx, dy = hips - shoulders  # image y points down: upright means hips below shoulders
+    length = float(np.hypot(dx, dy))
+    return length >= MIN_TORSO_PX and dy / length >= UPRIGHT_MIN
 
 
 class PoseSample:
@@ -250,6 +266,21 @@ RECOVER_S = 1.0            # standing this long after a fall -> got up
 RECOVER_RISE = 0.8         # ...with the hips this many torso lengths above where they were
 WATCH_KEEP_S = 10.0        # a recovery is still reported this long afterwards
 
+# People around a fallen person (phase 2) ---------------------------------------
+# Distances are between the people's floor points (bottom centre of each box),
+# in the fallen person's torso lengths. A standing adult is about 3 torso lengths
+# tall, so 6 torso lengths is roughly two body lengths.
+NEARBY_TORSOS = 6.0        # closer than this = "nearby"
+WITH_THEM_TORSOS = 2.5     # closer than this (about arm's reach + kneeling) ...
+WITH_THEM_S = 2.0          # ...for this long = "with them" (someone is helping)
+APPROACH_TORSOS = 1.0      # got this much closer ...
+APPROACH_S = 2.0           # ...within this many seconds = "coming over"
+NO_RESPONSE_S = 20.0       # people nearby this long and nobody with them = "not responded"
+DEPTH_RATIO = 2.0          # torso sizes differing more than this = different depth, not near
+BYSTANDER_FORGET_S = 3.0   # a bystander unseen this long is dropped from the list
+REKEY_S = 1.5              # a new ID appearing this soon after a bystander vanished ...
+REKEY_TORSOS = 1.5         # ...about this close to where they were is the same person
+
 
 def movement_score(history: PoseHistory, span: float = MOVE_SPAN_S) -> float | None:
     """How far the person moved in the last `span` seconds, in torso lengths.
@@ -291,7 +322,8 @@ class PostFallWatch:
     be judged, so being hidden behind furniture never counts as lying still."""
     __slots__ = ("confirmed_at", "last_t", "still_s", "longest_still_s", "moved", "last_move_t",
                  "critical_at", "moved_after_critical", "standing_since", "recovered_at",
-                 "fall_hip_y", "scale", "above")
+                 "fall_hip_y", "scale", "above", "bystanders", "helpers", "helped_at",
+                 "nearby_since", "ever_nearby")
 
     def __init__(self, t: float, history: PoseHistory):
         self.confirmed_at = self.last_t = t
@@ -307,6 +339,11 @@ class PostFallWatch:
         self.fall_hip_y = float(hips[1]) if hips is not None else None  # pixels, at confirmation
         self.scale = history.body_scale()
         self.above = 0  # consecutive frames over MOVE_THRESHOLD
+        self.bystanders: dict[int, dict] = {}  # person ID -> first/current distance, times
+        self.helpers: list[int] = []           # who has been with them, in order of arrival
+        self.helped_at = None                  # when the first helper reached them
+        self.nearby_since = None               # when someone was first nearby
+        self.ever_nearby: set[int] = set()
 
     def update(self, t: float, history: PoseHistory, seen: bool) -> None:
         dt = min(max(t - self.last_t, 0.0), MOVE_MAX_GAP_S)
@@ -337,6 +374,76 @@ class PostFallWatch:
             if self.still_s >= STILL_CRITICAL_S and self.critical_at is None:
                 self.critical_at = t
 
+    def update_bystanders(self, t: float, fallen_box, others) -> None:
+        """`others`: (person ID, box, torso px or None, posture state) for every
+        other person seen in this frame. A new bystander must be standing when
+        first seen (so someone else who fell is not a helper); after that they
+        count whatever their posture, because a helper kneels or crouches."""
+        if self.recovered_at is not None:
+            return
+        fx, fy = (fallen_box[0] + fallen_box[2]) / 2, fallen_box[3]
+        scale = self.scale
+        if not scale:
+            return
+        seen_now = {o[0] for o in others}
+        for pid, box, torso, state in others:
+            known = self.bystanders.get(pid)
+            if torso and max(torso, scale) / min(torso, scale) > DEPTH_RATIO:
+                continue  # much nearer to or farther from the camera: not really close
+            bx, by = (box[0] + box[2]) / 2, box[3]
+            distance = float(np.hypot(bx - fx, by - fy)) / scale
+            if known is None and state != "standing":
+                # Kneeling down can change a helper's box so much that the tracker
+                # gives them a new ID: take over a bystander who just vanished here.
+                lost = [old for old, b in self.bystanders.items() if old not in seen_now
+                        and t - b["last_t"] <= REKEY_S and abs(b["d"] - distance) <= REKEY_TORSOS]
+                if not lost:
+                    continue  # never seen standing: someone else who fell is not a helper
+                old = min(lost, key=lambda o: abs(self.bystanders[o]["d"] - distance))
+                known = self.bystanders[pid] = self.bystanders.pop(old)
+                self.helpers = [pid if h == old else h for h in self.helpers]
+                if old in self.ever_nearby:
+                    self.ever_nearby.discard(old)
+                    self.ever_nearby.add(pid)
+            if known is None:
+                known = self.bystanders[pid] = {"trail": deque(), "close_since": None}
+            known["d"], known["last_t"] = distance, t
+            trail = known["trail"]  # (time, distance) over the last APPROACH_S + 1 s
+            trail.append((t, distance))
+            while trail and t - trail[0][0] > APPROACH_S + 1.0:
+                trail.popleft()
+            if distance <= NEARBY_TORSOS:
+                self.ever_nearby.add(pid)
+                if self.nearby_since is None:
+                    self.nearby_since = t
+            if distance <= WITH_THEM_TORSOS:
+                known["close_since"] = known["close_since"] if known["close_since"] is not None else t
+                if t - known["close_since"] >= WITH_THEM_S and pid not in self.helpers:
+                    self.helpers.append(pid)
+                    if self.helped_at is None:
+                        self.helped_at = t
+            else:
+                known["close_since"] = None
+        for pid in [pid for pid, b in self.bystanders.items() if t - b["last_t"] > BYSTANDER_FORGET_S]:
+            del self.bystanders[pid]
+
+    @staticmethod
+    def _closing_in(bystander: dict, t: float) -> bool:
+        """Distance dropped by APPROACH_TORSOS within the last APPROACH_S seconds."""
+        recent = [d for when, d in bystander["trail"] if t - when <= APPROACH_S]
+        return bool(recent) and max(recent) - bystander["d"] >= APPROACH_TORSOS
+
+    def helper_ids(self, t: float) -> set[int]:
+        """Bystanders (seen standing when they came) now near this person. While
+        their torso stays upright, their kneeling or crouching is not counted as
+        a fall of their own (see PersonTracker.update)."""
+        if self.recovered_at is not None:
+            return set()
+        return {pid for pid, b in self._current(t).items() if b["d"] <= NEARBY_TORSOS}
+
+    def _current(self, t: float) -> dict[int, dict]:
+        return {pid: b for pid, b in self.bystanders.items() if t - b["last_t"] <= 0.5}
+
     def _hips_risen(self, sample: PoseSample) -> bool:
         """Standing posture AND hips clearly higher than at the fall, so a person
         lying towards the camera (which can look upright) is not called 'got up'."""
@@ -366,6 +473,26 @@ class PostFallWatch:
             "critical": self.critical_at is not None,
             "moved_after_critical": self.moved_after_critical,
             "down_s": round((self.recovered_at or t) - self.confirmed_at, 1),
+            **self.bystander_report(t),
+        }
+
+    def bystander_report(self, t: float) -> dict:
+        current = self._current(t)
+        nearby = sorted(pid for pid, b in current.items() if b["d"] <= NEARBY_TORSOS)
+        with_them = sorted(pid for pid, b in current.items()
+                           if b["close_since"] is not None and t - b["close_since"] >= WITH_THEM_S)
+        approaching = sorted(pid for pid, b in current.items() if pid not in with_them
+                             and self._closing_in(b, t) and b["d"] <= NEARBY_TORSOS * 1.5)
+        no_response = (self.helped_at is None and self.nearby_since is not None
+                       and t - self.nearby_since >= NO_RESPONSE_S and not approaching)
+        return {
+            "nearby": nearby,              # other people within ~2 body lengths now
+            "with_them": with_them,        # within reach for 2 s or more now
+            "approaching": approaching,    # coming closer, not with them yet
+            "helpers": list(self.helpers), # everyone who has been with them
+            "help_after_s": round(self.helped_at - self.confirmed_at, 1) if self.helped_at is not None else None,
+            "ever_nearby": sorted(self.ever_nearby),
+            "no_response": no_response,    # people nearby for 20 s, nobody came
         }
 
     def expired(self, t: float) -> bool:
@@ -383,5 +510,20 @@ def watch_label(report: dict | None) -> str:
         return " - moving"
     if status == "recovered":
         return " - got up"
+    if report.get("with_them"):
+        return " - helper with them"
+    return ""
+
+
+def bystander_label(fallen_reports: dict, person_id: int) -> str:
+    """Label suffix for a person who is with, or coming to, someone who fell."""
+    for fallen_id, report in fallen_reports.items():
+        if person_id in report.get("with_them", ()):
+            return f" - with #{fallen_id}"
+        if person_id in report.get("approaching", ()):
+            return f" - going to #{fallen_id}"
+    for fallen_id, report in fallen_reports.items():
+        if person_id in report.get("nearby", ()):
+            return f" - near #{fallen_id}"
     return ""
 
