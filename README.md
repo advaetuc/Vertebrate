@@ -9,19 +9,25 @@
 ![Runtime](https://img.shields.io/badge/Runtime-Local_CPU-172B4D?style=flat-square)
 [![License](https://img.shields.io/badge/Original_code-MIT-2EA043?style=flat-square)](LICENSE)
 
-A focused webcam application that turns human pose geometry into visible fall-posture alerts.
+A local webcam fall monitor: it confirms a fall per person, describes how it happened, watches what happens next, and alerts the people around and caregivers — all on the CPU, offline.
 
 </div>
 
 ---
 
-## One entry point. Two threads. A live view.
+> **Project status and handoff:** see [`HANDOFF.md`](HANDOFF.md) for the current
+> state, open issues and next steps; [`CONTEXT.md`](CONTEXT.md) is the full
+> architecture and maintenance guide.
 
-`app.py` starts the application; implementation is organized under `app_modules/` so each class and shared helper can be found directly. The runtime behavior and interface are unchanged. `app.py` provides a dark control-room interface: green/red skeleton overlays
-on a live view, a status sidebar (urgency meter, people in view, frame
-rate, falls today, location, alarm setting), a live location/time watermark,
-and banners that escalate from **Fall detected** to a pulsing **Emergency
-alarm**. It looks the same on Windows and macOS. Inference runs
+## One entry point. Three threads. A live view.
+
+`app.py` starts the application; all code is organised under `app_modules/`.
+The window is a dark control-room interface: green/red skeleton overlays with
+per-person labels on a live view, a status sidebar (urgency meter, people in
+view, frame rate, falls today, location, alarm setting, caregiver alerts), a
+live location/time watermark, and a banner coloured by how urgent the fall is,
+escalating to a pulsing **Emergency alarm**. It looks the same on Windows and
+macOS. Inference runs
 locally on the CPU. The application does not upload or record webcam footage;
 the only optional network use is a text alert to caregivers on Discord.
 
@@ -34,20 +40,26 @@ the only optional network use is a text alert to caregivers on Discord.
 - `app_modules/tracking.py` — per-person tracking (`PersonTracker`): IDs and each person's 5-frame fall check.
 - `app_modules/fallanalysis.py` — fall analysis: each person's last 8 s of keypoints (`PoseHistory`, measured in torso lengths so near and far people compare) and the detector's real frame rate (`FrameRateMeter`), movement after a fall, people around, sudden vs gradual and the priority of each fall.
 - `app_modules/falllogdialog.py` and the UI component modules (`videoview.py`, `urgencymeter.py`, `stattile.py`, `logomark.py`) — focused behavior and widgets.
-- `app_modules/common.py` — shared settings, constants, Qt imports, and helper functions.
+- `app_modules/common.py` — shared settings, constants, Qt imports, the posture rules and the video labels.
+- `tests/` — automated tests (no camera needed); see *Testing the fall analysis*.
+- `app_modules/evidencemeter.py` and `debounce.py` are no longer used and are due to be removed.
 
 ```mermaid
 flowchart LR
-    A[Webcam 0] --> B[Background QThread]
-    B --> C[YOLO11 pose + geometry + per-person tracking]
-    C --> D[OpenCV overlays]
-    D -->|Copied QImage + boolean via Qt signal| E[Main thread: PySide6 GUI]
+    A[Webcam 0] --> B[Camera thread]
+    B --> C[YOLO11 pose + posture + per-person tracking]
+    C --> F[Fall analysis: movement, people around, type, pattern, priority]
+    F --> D[OpenCV labels]
+    D -->|frame_ready: QImage, IDs, analysis as object| E[GUI thread: window, fall log, alarm]
+    E -->|alerts| G[Discord sender thread]
     E -->|Start / cooperative Stop| B
 ```
 
-The worker owns the camera and model; the main thread owns every widget.
-Only one frame signal may be pending, preventing an image backlog.
-Camera release happens in the worker during shutdown.
+The camera thread owns the camera, the model and the whole analysis; the GUI
+thread owns every widget; Discord messages go through their own sender thread.
+Only one frame signal may be pending, preventing an image backlog. The
+analysis is sent to the window as a Python `object` — as a `dict` it arrived
+empty (fixed 25 Nov 2026). Camera release happens in the camera thread.
 
 ## The heuristic
 
@@ -60,7 +72,10 @@ width / height > 1.2
 ```
 
 Image Y increases downward. Missing/zeroed spine landmarks disable the spine
-check; the bounding-box check remains available. Red overlays indicate matching
+check; the bounding-box check remains available. The wide-box check also needs
+a hip and a knee or ankle in view, and a person **too close to the camera**
+(box over 45 % of the frame, or spanning its full height) is labelled
+`Too close to camera` and never counts as a fall. Red overlays indicate matching
 posture; green indicates the rule did not match.
 
 A fall is confirmed **per person**: a small built-in tracker gives each person
@@ -146,10 +161,12 @@ this device; to also reach people elsewhere, set up caregiver alerts.
 
 ### Caregiver alerts (Discord)
 
-The app can post to a Discord channel when a fall is detected, when the alarm
-rings and when the fall ends. Each message names the person (`#2`), gives the time, how long they
-have been down and the location with a Google Maps link. No images or video are
-ever sent.
+The app can post to a Discord channel when a fall is detected, when someone
+lies still (Critical), when they move again, when someone reaches them, when
+nobody nearby responds, when the alarm rings and when the fall ends or they get
+up. Each message names the person (`#2`) and carries the priority colour, how
+they fell, who is around, the time, how long they have been down and the
+location with a Google Maps link. No images or video are ever sent.
 
 1. In Discord, make a channel for the caregivers (or use an existing one).
 2. Choose how to connect:
@@ -298,8 +315,8 @@ rate, model time, frame size, system). Numbers only; never images.
 
 Each tracked person also keeps their last 8 seconds of keypoints. Positions are
 measured in torso lengths (shoulders to hips), so a movement means the same
-whether the person is near or far from the camera. The fall analysis below
-(movement after a fall, people nearby, sudden vs gradual) is built on it.
+whether the person is near or far from the camera. The fall analysis above
+(movement after a fall, people nearby, sudden vs gradual, patterns) is built on it.
 
 ### Urgency meter
 
@@ -333,28 +350,38 @@ still visible.
 ## Workspace after cleanup
 
 ```text
-app.py                       Standalone application
-requirements.txt             V1 CPU dependencies
+app.py                       Launcher
+app_modules/                 All application code
+tests/                       Automated tests (unittest, no camera)
+README.md                    This file
+CONTEXT.md                   Architecture and maintenance guide
+HANDOFF.md                   Current state, open issues, next steps
+requirements.txt             Windows CPU dependencies
+requirements_macOS.txt       macOS dependencies
 requirements-win-cpu.lock    Preserved historical full environment lock
 LICENSE                      MIT grant for original code
-THIRD_PARTY_NOTICES.md        Dependency and model license scope
+THIRD_PARTY_NOTICES.md       Dependency and model license scope
 models/                      Local weights and provenance
 data/videos/                 Preserved local footage; Git-ignored
-runtime/                     Generated local settings; Git-ignored
+runtime/                     Logs, settings, webhook file; Git-ignored
 .archive/                    Legacy backups; Git-ignored
 docs/acknowledgements/       Project acknowledgement letter
 ```
 
-`requirements.txt` is the V1 installation path. The historical lock includes
-legacy/test packages and remains available for reproducing the old environment.
+`requirements.txt` (Windows) and `requirements_macOS.txt` (macOS) are the
+installation paths. The historical lock includes legacy/test packages and
+remains available for reproducing the old environment.
 Weights and videos stay on disk and are excluded from new Git commits.
 
 ## Interpretation
 
-This detects posture, not its cause. Deliberately lying down, camera rotation,
+This detects and describes posture, not its cause. The fall types and patterns
+(slip, trip, collapse, hand to chest, …) are what a single camera sees in a 2D
+image — **not a medical diagnosis**. Deliberately lying down, camera rotation,
 occlusion, and pose errors can affect alerts. The 20-pixel threshold depends on
-image scale. Development observations are not an independently validated
-accuracy guarantee.
+image scale. The analysis thresholds were checked on synthetic stick-figure
+falls only, not yet on real footage; development observations are not an
+independently validated accuracy guarantee.
 
 **Local demo — no external emergency dispatch.**
 
