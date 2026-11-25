@@ -5,8 +5,9 @@ from .tracking import PersonTracker
 
 class CameraThread(QThread):
     # Annotated frame, alert (any person confirmed), leading person's streak (0..5),
-    # leading person's ID (0 = none), people detected, IDs of confirmed people.
-    frame_ready = Signal(QImage, bool, int, int, int, list)
+    # leading person's ID (0 = none), people detected, IDs of confirmed people,
+    # and {person ID: report} for everyone watched after a fall (fallanalysis.py).
+    frame_ready = Signal(QImage, bool, int, int, int, list, dict)
     # Once a second: frames the detector processes per second, median model time
     # in ms, and how many frames a 5 s pose history holds at that rate.
     stats_ready = Signal(float, float, int)
@@ -67,7 +68,8 @@ class CameraThread(QThread):
                     h, w = rgb.shape[:2]
                     image = QImage(rgb.data, w, h, rgb.strides[0], QImage.Format.Format_RGB888).copy()
                     self._frame_pending.set()
-                    self.frame_ready.emit(image, is_fallen, evidence, leader_id, people, confirmed)
+                    self.frame_ready.emit(image, is_fallen, evidence, leader_id, people, confirmed,
+                                          tracker.aftermath())
         except Exception as exc:
             if not self.isInterruptionRequested():
                 self.error.emit(f"{type(exc).__name__}: {exc}")

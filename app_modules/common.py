@@ -122,6 +122,7 @@ LOG_FIELDS = (
     "device", "fall_detected_at", "ended_at", "utc_offset", "duration", "duration_seconds",
     "latitude", "longitude", "accuracy_m", "location_source", "ended_by",
     "alarm_after_seconds", "alarm_rang_at", "alarm_silenced_at", "person_ids",
+    "after_fall", "longest_still_seconds", "no_movement_alert_at",
 )
 
 ALARM_DEFAULT_S = 30
@@ -201,6 +202,11 @@ def fallen_geometry(box, keypoints):
             inverted = shoulder_y > hip_y + 20.0
     return bool(wide or inverted)
 
+def watch_label(report) -> str:
+    """Label suffix for a person being watched after a fall (see fallanalysis.py)."""
+    from .fallanalysis import watch_label as label  # fallanalysis imports this module
+    return label(report)
+
 def annotate(frame, result, tracker, timestamp=None):
     """Paint this result onto its own frame and update per-person confirmation.
     `tracker` is a tracking.PersonTracker (worker thread only). With a
@@ -220,8 +226,11 @@ def annotate(frame, result, tracker, timestamp=None):
         thickness = 4 if track.confirmed else 2
         x1, y1, x2, y2 = map(int, box)
         cv2.rectangle(frame, (x1, y1), (x2, y2), color, thickness)
+        watch = track.watch.report(track.watch.last_t) if getattr(track, "watch", None) else None
         if track.confirmed:
-            text = f"#{track.id} FALL CONFIRMED"
+            text = f"#{track.id} FALL CONFIRMED" + watch_label(watch)
+        elif watch and watch["status"] == "recovered":
+            text = f"#{track.id} Got up"
         elif is_fallen:
             text = f"#{track.id} Fallen posture {track.streak}/{CONSECUTIVE_FRAMES}"
         elif state == "too_close":

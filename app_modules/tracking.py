@@ -1,7 +1,7 @@
 """Per-person tracking: follows each detected person so a fall is confirmed
 for ONE person, not across the whole scene. Pure NumPy, same on Windows and macOS."""
 from .common import *  # shared Qt imports, constants, and helpers
-from .fallanalysis import PoseHistory
+from .fallanalysis import PoseHistory, PostFallWatch
 
 # Per-person tracking -------------------------------------------------------
 # Detections are linked to people from frame to frame so a fall is confirmed for
@@ -33,7 +33,7 @@ def center_shift(a, b) -> float:
 class Track:
     """One person followed across frames, with their own fallen-frame streak
     and the last few seconds of their poses (for fall analysis)."""
-    __slots__ = ("id", "box", "streak", "misses", "history")
+    __slots__ = ("id", "box", "streak", "misses", "history", "watch")
 
     def __init__(self, track_id: int, box):
         self.id = track_id
@@ -41,6 +41,7 @@ class Track:
         self.streak = 0   # consecutive fallen frames of THIS person, capped at CONSECUTIVE_FRAMES
         self.misses = 0   # consecutive frames this person was not detected
         self.history = PoseHistory()  # ~5 s of this person's keypoints (fallanalysis.py)
+        self.watch: PostFallWatch | None = None  # what they do after a confirmed fall
 
     @property
     def confirmed(self) -> bool:
@@ -103,7 +104,24 @@ class PersonTracker:
                 if timestamp is not None:
                     track.history.trim(timestamp)  # a missed frame is a gap, not a sample
         self.tracks = [track for track in self.tracks if track.misses <= TRACK_MAX_MISSES]
+        if timestamp is not None:
+            self._update_watches(timestamp, seen)
         return assigned
+
+    def _update_watches(self, t: float, seen: set) -> None:
+        """Start watching a person when their fall is confirmed (again, if they
+        had got up), and follow what they do until they get up."""
+        for track in self.tracks:
+            if track.confirmed and (track.watch is None or track.watch.recovered_at is not None):
+                track.watch = PostFallWatch(t, track.history)
+            elif track.watch is not None:
+                track.watch.update(t, track.history, id(track) in seen)
+                if track.watch.expired(t):
+                    track.watch = None
+
+    def aftermath(self) -> dict:
+        """{person ID: report} for everyone being watched after a fall."""
+        return {track.id: track.watch.report(track.watch.last_t) for track in self.tracks if track.watch}
 
     def confirmed_ids(self) -> list[int]:
         return sorted(track.id for track in self.tracks if track.confirmed)

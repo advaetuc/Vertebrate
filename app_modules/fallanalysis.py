@@ -1,8 +1,10 @@
-"""Fall analysis groundwork (phase 0): per-person pose history and frame-rate
-measurement. Nothing here changes an alert yet; later phases (movement after
-the fall, bystanders, sudden vs gradual, fall patterns) read this history.
+"""Fall analysis: per-person pose history and frame-rate measurement (phase 0),
+and the watch after a confirmed fall: is the person moving, lying still, or
+back on their feet? (phase 1). Later phases (bystanders, sudden vs gradual,
+fall patterns) build on the same history.
 Pure Python + NumPy, same on Windows and macOS. Worker thread only."""
 from .common import *  # shared Qt imports, constants, and helpers
+import warnings
 
 # Pose history ---------------------------------------------------------------
 HISTORY_SECONDS = 5.0        # how far back each person's pose history reaches
@@ -233,3 +235,153 @@ def write_performance_log(device: str, started: datetime, summary: dict, frame_s
     except OSError as exc:
         print(f"[performance] could not write {path}: {exc}", file=sys.stderr, flush=True)
         return None
+
+
+# Movement after a fall (phase 1) -----------------------------------------------
+MOVE_SPAN_S = 1.0          # movement is measured between now and about 1 s ago
+MOVE_AVERAGE_S = 0.5       # ...comparing the average pose over this long at each end
+MOVE_CONFIRM_FRAMES = 2    # frames in a row above the threshold before it counts as movement
+MOVE_THRESHOLD = 0.15      # torso lengths a body part must move in that time to count
+MOVE_MIN_JOINTS = 3        # joints that must be visible in both frames to judge at all
+MOVE_MAX_GAP_S = 0.5       # longer gaps between frames do not add to "still" time
+STILL_CRITICAL_S = 15.0    # lying still this long after a confirmed fall -> critical
+MOVING_RECENT_S = 3.0      # moved within this long -> "moving"
+RECOVER_S = 1.0            # standing this long after a fall -> got up
+RECOVER_RISE = 0.8         # ...with the hips this many torso lengths above where they were
+WATCH_KEEP_S = 10.0        # a recovery is still reported this long afterwards
+
+
+def movement_score(history: PoseHistory, span: float = MOVE_SPAN_S) -> float | None:
+    """How far the person moved in the last `span` seconds, in torso lengths.
+
+    Compares the average pose of the last MOVE_AVERAGE_S with the average pose
+    `span` seconds earlier, so keypoint wobble on a still person averages out.
+    Uses the second-largest joint movement: one jittery keypoint is ignored,
+    while a moving arm (wrist and elbow) or a turning head still counts.
+    None when there is not enough to judge (too few frames or joints, a gap)."""
+    samples = history.samples
+    if len(samples) < 2:
+        return None
+    now = samples[-1].t
+    recent = [s for s in samples if now - s.t <= MOVE_AVERAGE_S]
+    before = [s for s in samples if span <= now - s.t <= span + MOVE_AVERAGE_S]
+    if not before:
+        return None
+    # a gap: the newest "before" frame must be close to `span` ago
+    if min(now - s.t for s in before) > span * 1.5:
+        return None
+    scale = history.body_scale()
+    if not scale:
+        return None
+    with np.errstate(invalid="ignore"), warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)  # all-NaN joints are expected
+        pose_now = np.nanmean(np.stack([s.joints for s in recent]), axis=0)
+        pose_before = np.nanmean(np.stack([s.joints for s in before]), axis=0)
+    moved = np.hypot(*(pose_now - pose_before).T) / scale  # NaN where either is missing
+    moved = moved[np.isfinite(moved)]
+    if len(moved) < MOVE_MIN_JOINTS:
+        return None
+    return float(np.sort(moved)[-2])
+
+
+class PostFallWatch:
+    """What one person does after their fall is confirmed.
+
+    Still time only grows on frames where the person is actually seen and can
+    be judged, so being hidden behind furniture never counts as lying still."""
+    __slots__ = ("confirmed_at", "last_t", "still_s", "longest_still_s", "moved", "last_move_t",
+                 "critical_at", "moved_after_critical", "standing_since", "recovered_at",
+                 "fall_hip_y", "scale", "above")
+
+    def __init__(self, t: float, history: PoseHistory):
+        self.confirmed_at = self.last_t = t
+        self.still_s = self.longest_still_s = 0.0
+        self.moved = False
+        self.last_move_t = None
+        self.critical_at = None           # when still time first reached STILL_CRITICAL_S
+        self.moved_after_critical = False
+        self.standing_since = None
+        self.recovered_at = None
+        latest = history.latest
+        hips = joint_midpoint(latest.joints, HIPS) if latest is not None else None
+        self.fall_hip_y = float(hips[1]) if hips is not None else None  # pixels, at confirmation
+        self.scale = history.body_scale()
+        self.above = 0  # consecutive frames over MOVE_THRESHOLD
+
+    def update(self, t: float, history: PoseHistory, seen: bool) -> None:
+        dt = min(max(t - self.last_t, 0.0), MOVE_MAX_GAP_S)
+        self.last_t = t
+        latest = history.latest
+        if not seen or latest is None or latest.t != t or self.recovered_at is not None:
+            return
+        if latest.state == "standing" and self._hips_risen(latest):
+            self.standing_since = self.standing_since if self.standing_since is not None else t
+            if t - self.standing_since >= RECOVER_S:
+                self.recovered_at = t
+                return
+        else:
+            self.standing_since = None
+        score = movement_score(history)
+        if score is None:
+            return
+        self.above = self.above + 1 if score >= MOVE_THRESHOLD else 0
+        if self.above >= MOVE_CONFIRM_FRAMES:
+            self.moved = True
+            self.last_move_t = t
+            if self.critical_at is not None:
+                self.moved_after_critical = True
+            self.still_s = 0.0
+        elif self.above == 0:
+            self.still_s += dt
+            self.longest_still_s = max(self.longest_still_s, self.still_s)
+            if self.still_s >= STILL_CRITICAL_S and self.critical_at is None:
+                self.critical_at = t
+
+    def _hips_risen(self, sample: PoseSample) -> bool:
+        """Standing posture AND hips clearly higher than at the fall, so a person
+        lying towards the camera (which can look upright) is not called 'got up'."""
+        hips = joint_midpoint(sample.joints, HIPS)
+        if hips is None or self.fall_hip_y is None or not self.scale:
+            return True  # nothing to compare: trust the posture rule
+        return (self.fall_hip_y - float(hips[1])) / self.scale >= RECOVER_RISE
+
+    def status(self, t: float) -> str:
+        """'recovered', 'still' (critical), 'moving', or 'watching' (not judged yet)."""
+        if self.recovered_at is not None:
+            return "recovered"
+        if self.still_s >= STILL_CRITICAL_S:
+            return "still"
+        if self.last_move_t is not None and t - self.last_move_t <= MOVING_RECENT_S:
+            return "moving"
+        return "watching"
+
+    def report(self, t: float) -> dict:
+        """Plain values for the GUI thread (sent with each frame)."""
+        return {
+            "status": self.status(t),
+            "still_s": round(self.still_s, 1),
+            "longest_still_s": round(self.longest_still_s, 1),
+            "since_fall_s": round(t - self.confirmed_at, 1),
+            "moved": self.moved,
+            "critical": self.critical_at is not None,
+            "moved_after_critical": self.moved_after_critical,
+            "down_s": round((self.recovered_at or t) - self.confirmed_at, 1),
+        }
+
+    def expired(self, t: float) -> bool:
+        return self.recovered_at is not None and t - self.recovered_at > WATCH_KEEP_S
+
+
+def watch_label(report: dict | None) -> str:
+    """Short text added to a person's label on the video."""
+    if not report:
+        return ""
+    status = report["status"]
+    if status == "still":
+        return f" - NO MOVEMENT {report['still_s']:.0f} s"
+    if status == "moving":
+        return " - moving"
+    if status == "recovered":
+        return " - got up"
+    return ""
+

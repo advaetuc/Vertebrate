@@ -7,8 +7,11 @@ class FallLog:
     An event starts when any person's fall is confirmed (five consecutive fallen
     frames of that one person) and ends when no one has been confirmed for
     END_GRACE_S (end time = when it first went off), or when the camera stops.
-    person_ids lists who was confirmed; IDs restart with each camera session. One row is appended per finished event. The file lives in
-    runtime/logs/falls/<device>.csv and opens directly in Excel or Numbers.
+    person_ids lists who was confirmed; IDs restart with each camera session.
+    What the person did afterwards (moved, lay still, got up) is recorded from
+    the camera thread's post-fall reports (note_aftermath). One row is appended
+    per finished event. The file lives in runtime/logs/falls/<device>.csv and
+    opens directly in Excel or Numbers.
     """
 
     def __init__(self, device: str):
@@ -28,7 +31,10 @@ class FallLog:
             self._clear_since = None
             if self.current is None:
                 self.current = {"start": now, "location": location, "people": set(person_ids),
-                                "alarm_after": None, "alarm_rang": None, "alarm_silenced": None}
+                                "alarm_after": None, "alarm_rang": None, "alarm_silenced": None,
+                                "moved": False, "longest_still": 0.0, "critical_at": None,
+                                "critical_ids": set(), "moved_again": False, "recovered": {},
+                                "still_now": {}}
                 return True
             self.current["people"].update(person_ids)  # someone else may fall during the event
             if self.current["location"] is None and location is not None:
@@ -39,9 +45,41 @@ class FallLog:
         if self._clear_since is None:
             self._clear_since = now
         elif (now - self._clear_since).total_seconds() >= END_GRACE_S:
-            self._finish(self._clear_since, "Posture cleared")
+            got_up = bool(self.current["recovered"]) and not any(self.current["still_now"].values())
+            self._finish(self._clear_since, "Got up" if got_up else "Posture cleared")
             return True
         return False
+
+    def note_aftermath(self, aftermath: dict) -> list[str]:
+        """Record the camera thread's post-fall reports ({person ID: report}) for
+        the people in the ongoing event. Returns what changed for alerts:
+        'critical' the first time someone lies still for STILL_CRITICAL_S, and
+        'moving_again' the first time a still person moves afterwards."""
+        event = self.current
+        if event is None:
+            return []
+        changes = []
+        for pid, report in aftermath.items():
+            if pid not in event["people"]:
+                continue
+            event["moved"] |= bool(report["moved"])
+            event["longest_still"] = max(event["longest_still"], float(report["longest_still_s"]))
+            event["still_now"][pid] = report["status"] == "still"
+            if report["status"] == "recovered":
+                event["recovered"][pid] = float(report["down_s"])
+            if report["critical"] and pid not in event["critical_ids"]:
+                event["critical_ids"].add(pid)
+                if event["critical_at"] is None:
+                    event["critical_at"] = datetime.now().astimezone()
+                    changes.append("critical")
+            if report["moved_after_critical"] and not event["moved_again"]:
+                event["moved_again"] = True
+                changes.append("moving_again")
+        return changes
+
+    def still_people(self) -> list[int]:
+        """People in the ongoing event lying still past the critical time."""
+        return sorted(pid for pid, still in self.current["still_now"].items() if still) if self.current else []
 
     def close_event(self, reason: str) -> bool:
         """End an ongoing event (camera stopped, error, app closing)."""
@@ -88,6 +126,9 @@ class FallLog:
             "alarm_rang_at": stamp(event["alarm_rang"]),
             "alarm_silenced_at": stamp(event["alarm_silenced"]),
             "person_ids": ";".join(str(i) for i in sorted(event["people"])),
+            "after_fall": self.after_fall_text(event),
+            "longest_still_seconds": f"{event['longest_still']:.0f}",
+            "no_movement_alert_at": stamp(event["critical_at"]),
         }
         self.last_finished = {**row, "location": location, "seconds": seconds, "people": sorted(event["people"])}
         try:
@@ -104,6 +145,19 @@ class FallLog:
         except OSError as exc:
             self.last_error = f"Could not write the fall log: {exc}"
             print(self.last_error, file=sys.stderr)
+
+    @staticmethod
+    def after_fall_text(event: dict) -> str:
+        """'Got up after 25 s', 'No movement for 18 s', 'Moved', or 'Not judged'."""
+        if event["recovered"]:
+            return f"Got up after {format_duration(min(event['recovered'].values()))}"
+        if any(event["still_now"].values()):
+            return f"No movement for {format_duration(event['longest_still'])}"
+        if event["critical_at"] is not None:
+            return f"Still for {format_duration(event['longest_still'])}, then moved"
+        if event["moved"]:
+            return "Moved"
+        return "Not judged"
 
     def _upgrade_header(self) -> None:
         """Rewrite a log made by an older version so its columns match LOG_FIELDS."""

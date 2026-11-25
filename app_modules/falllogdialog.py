@@ -4,15 +4,15 @@ from .falllog import FallLog
 
 class FallLogDialog(QDialog):
     """Window listing this device's fall events; an ongoing fall is shown live on top."""
-    COLUMNS = ("Fall detected at", "Ended at", "Duration", "Person", "Alarm", "Location", "Location source",
-               "Ended by")
-    LOCATION_COLUMN = 5
+    COLUMNS = ("Fall detected at", "Ended at", "Duration", "Person", "After the fall", "Alarm", "Location",
+               "Location source", "Ended by")
+    LOCATION_COLUMN = 6
 
     def __init__(self, log: FallLog, parent=None):
         super().__init__(parent)
         self.log = log
         self.setWindowTitle(f"Fall log · {log.device}")
-        self.resize(980, 520)
+        self.resize(1100, 520)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(20, 18, 20, 18)
         layout.setSpacing(10)
@@ -81,6 +81,7 @@ class FallLogDialog(QDialog):
                 "alarm_rang_at": stamp(current["alarm_rang"]),
                 "alarm_silenced_at": stamp(current["alarm_silenced"]),
                 "person_ids": ";".join(str(i) for i in sorted(current["people"])),
+                "after_fall": FallLog.after_fall_text(current),
             }, True))
         entries += [(row, False) for row in rows]
         self.table.setRowCount(len(entries))
@@ -99,7 +100,8 @@ class FallLogDialog(QDialog):
             ids = [i for i in (row.get("person_ids") or "").split(";") if i]
             person = ", ".join(f"#{i}" for i in ids) if ids else "—"  # older rows have no IDs
             values = (row.get("fall_detected_at", ""), row.get("ended_at", ""), row.get("duration", ""),
-                      person, alarm, location, row.get("location_source", ""), row.get("ended_by", ""))
+                      person, row.get("after_fall") or "—", alarm, location, row.get("location_source", ""),
+                      row.get("ended_by", ""))
             for c, value in enumerate(values):
                 item = QTableWidgetItem(value)
                 if ongoing:

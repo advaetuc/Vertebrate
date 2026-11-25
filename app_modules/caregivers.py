@@ -21,6 +21,7 @@ NOTIFY_ATTEMPTS = 3
 # Git-ignored, so the URL (a secret: anyone with it can post) never reaches GitHub.
 FIXED_WEBHOOK_FILE = APP_DIR / "runtime" / "config" / "discord_webhook.txt"
 COLOR_FALL, COLOR_ALARM, COLOR_ENDED, COLOR_TEST = 0xFF8A4C, 0xF04452, 0x34D399, 0x2DD4BF
+COLOR_CRITICAL = 0xB0102A  # no movement after a fall: deeper red than the alarm
 
 
 def _https_context() -> ssl.SSLContext:
@@ -222,7 +223,8 @@ def caregiver_embed(kind: str, device: str, title: str, description: str, locati
                                 f"\nvia {source}", "inline": False})
     elif kind != "test":
         fields.append({"name": "Location", "value": "Not available on this device", "inline": False})
-    color = {"fall": COLOR_FALL, "alarm": COLOR_ALARM, "end": COLOR_ENDED}.get(kind, COLOR_TEST)
+    color = {"fall": COLOR_FALL, "alarm": COLOR_ALARM, "critical": COLOR_CRITICAL,
+             "end": COLOR_ENDED}.get(kind, COLOR_TEST)
     return {
         "title": title[:256],
         "description": description[:4000],

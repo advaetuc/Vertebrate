@@ -126,8 +126,33 @@ time. The camera thread's `FrameRateMeter` measures the rate the detector
 processes, which can be higher than the rate the window displays; it is emitted
 by `CameraThread.stats_ready(fps, model_ms, history_frames)` and shown in the
 Frames / second tile. Calling `update(boxes, fallen)` without a timestamp keeps
-the old behaviour and records no history. Nothing in this module changes an
-alert yet.
+the old behaviour and records no history. The post-fall watch (below) is the
+first user of this history.
+
+### After a fall (phase 1)
+
+`fallanalysis.PostFallWatch` starts on a track when its fall is confirmed (again,
+if the person had got up) and is updated by `PersonTracker` every frame.
+`movement_score()` compares the average pose of the last 0.5 s with the average
+pose 1 s earlier, in torso lengths, and takes the second-largest joint movement
+(one jittery joint is ignored). Movement = score ≥ 0.15 on 2 frames in a row.
+Still time grows only on frames where the person is seen and judged (gaps
+capped at 0.5 s), so being hidden never counts as lying still. Still ≥ 15 s =
+critical. Got up = posture "standing" for ≥ 1 s with the hips ≥ 0.8 torso
+lengths above their height at confirmation (if hips are visible). The watch is
+kept 10 s after recovery, then removed. `PersonTracker.aftermath()` gives
+`{person ID: report}` (status `watching` / `moving` / `still` / `recovered`,
+still_s, longest_still_s, moved, critical, moved_after_critical, down_s); it is
+sent as the last argument of `frame_ready`. In the GUI, `FallLog.note_aftermath()`
+records it for the people in the ongoing event and returns `critical` /
+`moving_again` once each; `MainWindow` then sends the `critical` Discord alert
+(new kind, colour `COLOR_CRITICAL`, always on when alerts are on) or a `fall`
+update. A fall whose people got up (and none is lying still) ends as
+"Got up" and sends a Recovered message. Log fields added: `after_fall`,
+`longest_still_seconds`, `no_movement_alert_at`. Thresholds were checked on
+synthetic poses with keypoint wobble (still person far away: worst score 0.14),
+not yet on real footage; tune them in `fallanalysis.py`. Video labels must stay
+ASCII (OpenCV's Hershey font).
 
 ### Data architecture and state
 
@@ -140,7 +165,8 @@ log CSV (see "Fall log" below).
 | Webcam frame | Worker memory | BGR NumPy array, annotated in place |
 | Model result | One inference iteration | Boxes and `keypoints.xy` only |
 | Person tracks | Worker session | ID, last box, streak (cap 5), missed frames; dropped after 15 misses |
-| Pose history | Worker session, per track | Last 5 s of keypoints (NaN = not visible), box and posture state; `fallanalysis.PoseHistory`, read in torso lengths; informs no alert yet |
+| Pose history | Worker session, per track | Last 5 s of keypoints (NaN = not visible), box and posture state; `fallanalysis.PoseHistory`, read in torso lengths |
+| Post-fall watch | Worker session, per track | `Track.watch` (`PostFallWatch`): moving / still / got up after a confirmed fall; reported each frame |
 | Frame rate | Worker session | `FrameRateMeter`: detector frames/s, model ms; `stats_ready` signal once a second |
 | Performance log | `runtime/logs/performance/<device>.csv` | One row per camera session: median/slowest fps, model ms, frame size, system; ignored by Git |
 | Display image | One pending signal | RGB QImage detached with `copy()` |

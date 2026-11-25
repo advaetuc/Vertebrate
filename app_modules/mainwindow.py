@@ -25,6 +25,7 @@ class MainWindow(QMainWindow):
         self._flash = False
         self._people = 0
         self._leader_id = 0  # person closest to a confirmed fall (0 = none)
+        self._aftermath = {}  # {person ID: post-fall report} from the camera thread
         self._frame_times = deque(maxlen=30)
         self._detect_fps = None  # frames the detector processes per second (camera thread)
         self._falls_today = 0
@@ -307,11 +308,31 @@ class MainWindow(QMainWindow):
         if current is None:
             return "Fall posture detected."
         who = self._who()
+        movement = self._movement_text()
+        movement = f" {movement}" if movement else ""
         if delay == 0:
-            return f"{who} down for {fallen_for}. The alarm is off."
+            return f"{who} down for {fallen_for}.{movement} The alarm is off."
         if current["alarm_rang"] is None:
-            return f"{who} down for {fallen_for}. Alarm in {self._alarm_remaining()} s."
-        return f"{who} down for {fallen_for}. Alarm silenced."
+            return f"{who} down for {fallen_for}.{movement} Alarm in {self._alarm_remaining()} s."
+        return f"{who} down for {fallen_for}.{movement} Alarm silenced."
+
+    def _movement_text(self) -> str:
+        """'#2 not moving for 18 s.' / '#2 moving.' for the people in the ongoing fall."""
+        current = self.fall_log.current
+        if current is None:
+            return ""
+        parts = []
+        for pid in sorted(current["people"]):
+            report = self._aftermath.get(pid)
+            if report is None:
+                continue
+            if report["status"] == "still":
+                parts.append(f"#{pid} not moving for {format_duration(report['still_s'])}")
+            elif report["status"] == "moving":
+                parts.append(f"#{pid} moving")
+            elif report["status"] == "recovered":
+                parts.append(f"#{pid} got up")
+        return (", ".join(parts) + ".") if parts else ""
 
     def _alarm_remaining(self) -> int:
         return max(0, int(self.alarm_delay.value() - self.fall_log.ongoing_seconds() + 0.999))
@@ -354,7 +375,15 @@ class MainWindow(QMainWindow):
             border[0].setAlpha(110)
         self.video.set_border(border[0], border[1], live)
 
-        if state == "fall":
+        still = self.fall_log.still_people()
+        if state == "fall" and still:
+            self.banner_title.setText(f"No movement — {people_text(still).lower()} lying still")
+            self.banner_detail.setText(self._fall_detail() + " Check on them now.")
+            self.banner.setStyleSheet(
+                f"QFrame#banner {{ background: {rgba(DANGER, .18)}; border: 1px solid {rgba(DANGER, .70)};"
+                f" border-radius: 14px; }} QLabel {{ color: {TEXT}; }}")
+            self.banner_icon.setStyleSheet(f"color: #FFFFFF; background: {DANGER}; border-radius: 18px;")
+        elif state == "fall":
             self.banner_title.setText(f"Fall detected — {self._who().lower()}")
             self.banner_detail.setText(self._fall_detail())
             self.banner.setStyleSheet(
@@ -364,7 +393,9 @@ class MainWindow(QMainWindow):
         elif state == "alarm":
             self.banner_title.setText(f"EMERGENCY ALARM — {self._who().lower()} down for "
                                       f"{format_duration(self.fall_log.ongoing_seconds())}")
-            self.banner_detail.setText("A siren is ringing on this device. Check on the person, then silence it.")
+            movement = self._movement_text()
+            self.banner_detail.setText((f"{movement} " if movement else "")
+                                       + "A siren is ringing on this device. Check on the person, then silence it.")
             self.banner.setStyleSheet(
                 f"QFrame#banner {{ background: {color}; border: 1px solid {rgba('#FFFFFF', .25)};"
                 f" border-radius: 14px; }} QLabel {{ color: #FFFFFF; }}")
@@ -447,6 +478,7 @@ class MainWindow(QMainWindow):
         self._detect_fps = None
         self._people = 0
         self._leader_id = 0
+        self._aftermath = {}
         self.meter.set_value(0)
         self.start_button.setEnabled(False)
         self.stop_button.setEnabled(True)
@@ -472,8 +504,8 @@ class MainWindow(QMainWindow):
         self.set_state("stopping")
         self.stop_timer.start()
 
-    @Slot(QImage, bool, int, int, int, list)
-    def show_frame(self, image, is_fallen, evidence, leader_id, people, confirmed_ids):
+    @Slot(QImage, bool, int, int, int, list, dict)
+    def show_frame(self, image, is_fallen, evidence, leader_id, people, confirmed_ids, aftermath):
         worker = self.sender()
         try:
             if worker is not self.worker or self._stopping:
@@ -483,6 +515,7 @@ class MainWindow(QMainWindow):
             self._frame_times.append(time.monotonic())
             self._people = people
             self._leader_id = leader_id
+            self._aftermath = aftermath
             self.meter.set_value(evidence)
             was_falling = self.fall_log.current is not None
             if self.fall_log.update(is_fallen, self.location.current_fix(), confirmed_ids):
@@ -491,6 +524,12 @@ class MainWindow(QMainWindow):
                     self.notify_fall_started()
                 elif was_falling and self.fall_log.current is None:
                     self.notify_fall_ended()
+            for change in self.fall_log.note_aftermath(aftermath):
+                if change == "critical":
+                    self.notify_no_movement()
+                    self.log_changed()
+                elif change == "moving_again":
+                    self.notify_moving_again()
             self.check_alarm()
             # An ongoing fall event (including its 2 s grace) keeps the fall state,
             # so the banner does not flicker on single missed frames.
@@ -540,6 +579,7 @@ class MainWindow(QMainWindow):
         self._stopping = False
         self._people = 0
         self._leader_id = 0
+        self._aftermath = {}
         self._frame_times.clear()
         self._detect_fps = None
         self.meter.set_value(0)
@@ -657,6 +697,31 @@ class MainWindow(QMainWindow):
             "The siren is ringing. Please check on them now.",
             current["location"], mention=True)
 
+    def notify_no_movement(self) -> None:
+        current = self.fall_log.current
+        still = self.fall_log.still_people()
+        if current is None or not still:
+            return
+        report = self._aftermath.get(still[0], {})
+        self._send_caregiver(
+            "critical", f"🔴 CRITICAL — {people_text(still)} not moving",
+            f"{people_text(still)} fell and has **not moved for {format_duration(report.get('still_s', 0))}** "
+            f"on **{self.fall_log.device}** (down for {format_duration(self.fall_log.ongoing_seconds())}). "
+            "They may be unconscious. Please check on them immediately or call emergency services.",
+            current["location"], mention=True,
+            extra_fields=[{"name": "Note", "value": "Movement judged from camera analysis — not a medical "
+                                                     "diagnosis.", "inline": False}])
+
+    def notify_moving_again(self) -> None:
+        current = self.fall_log.current
+        if current is None:
+            return
+        self._send_caregiver(
+            "fall", f"🟠 Update — {self._who()} moving again",
+            f"After lying still, {self._who().lower()} is moving again on **{self.fall_log.device}**, "
+            f"but is still down ({format_duration(self.fall_log.ongoing_seconds())}). Please still check on them.",
+            current["location"], mention=False)
+
     def notify_fall_ended(self) -> None:
         row = self.fall_log.last_finished
         if row is None:
@@ -668,6 +733,16 @@ class MainWindow(QMainWindow):
             if row.get("alarm_silenced_at"):
                 alarm += f", silenced {row['alarm_silenced_at'][-8:]}"
             extra.append({"name": "Alarm", "value": alarm, "inline": True})
+        if row.get("after_fall"):
+            extra.append({"name": "After the fall", "value": row["after_fall"], "inline": True})
+        if row["ended_by"] == "Got up":
+            self._send_caregiver(
+                "end", f"🟢 Recovered — {people_text(row.get('people', []))} got up",
+                f"{people_text(row.get('people', []))} got up again on **{self.fall_log.device}** after being "
+                f"down for {row['duration']} ({row['fall_detected_at'][-8:]}–{row['ended_at'][-8:]}). "
+                "No further alert for this fall.",
+                row["location"], mention=False, extra_fields=extra)
+            return
         self._send_caregiver(
             "end", f"✅ Fall ended — {people_text(row.get('people', []))}",
             f"{people_text(row.get('people', []))} was down for {row['duration']} on **{self.fall_log.device}** "

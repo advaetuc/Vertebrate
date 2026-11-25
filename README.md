@@ -170,6 +170,28 @@ Git. Keep the webhook URL and bot token private: anyone with them can post to
 the channel. Alerts need an internet connection; the local alarm and fall log
 work without one. No extra packages are needed on Windows or macOS.
 
+### After a fall: moving, still, or got up
+
+Once a person's fall is confirmed, Vertebrate keeps watching that person:
+
+- **Moving** — an arm, leg or the head moves (more than 0.15 torso lengths
+  within a second, seen on two frames in a row). The video label adds
+  `- moving`.
+- **No movement** — the person lies still for **15 seconds** (counted only
+  while they are visible). The banner turns red ("No movement — person #2 lying
+  still"), the label shows `- NO MOVEMENT 16 s`, and caregivers get a
+  🔴 **CRITICAL** Discord alert with a ping. If they move again later, a
+  🟠 "moving again" update follows.
+- **Got up** — they stand for a second with their hips clearly back up. The
+  fall ends with "Got up", and caregivers get a 🟢 **Recovered** message
+  instead of "Fall ended".
+
+The fall log has three new columns — *After the fall* (e.g. "Got up after
+25 s", "No movement for 18 s"), *longest still seconds* and the time of the
+no-movement alert — and the Fall log window shows *After the fall*. Older logs
+are upgraded automatically. This is camera analysis, not a medical diagnosis;
+the siren still follows the alarm delay you set.
+
 ### Frame rate and pose history
 
 The **Frames / second** tile shows how many frames the detector actually
