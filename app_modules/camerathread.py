@@ -1,6 +1,6 @@
 """CameraThread class."""
 from .common import *  # shared Qt imports, constants, and helpers
-from .fallanalysis import FPS_LOG_EVERY_SECONDS, FrameRateMeter, write_performance_log
+from .fallanalysis import FPS_LOG_EVERY_SECONDS, HISTORY_SECONDS, FrameRateMeter, write_performance_log
 from .tracking import PersonTracker
 
 class CameraThread(QThread):
@@ -9,7 +9,7 @@ class CameraThread(QThread):
     # and {person ID: report} for everyone watched after a fall (fallanalysis.py).
     frame_ready = Signal(QImage, bool, int, int, int, list, dict)
     # Once a second: frames the detector processes per second, median model time
-    # in ms, and how many frames a 5 s pose history holds at that rate.
+    # in ms, and how many frames a person's pose history holds at that rate.
     stats_ready = Signal(float, float, int)
     error = Signal(str)
 
@@ -58,7 +58,7 @@ class CameraThread(QThread):
                 if frame_time - last_log >= FPS_LOG_EVERY_SECONDS:
                     last_log = frame_time
                     print(f"[performance] {meter.fps:.1f} fps · model {meter.inference_ms:.0f} ms · "
-                          f"5 s history = {meter.history_frames()} frames", file=sys.stderr, flush=True)
+                          f"{HISTORY_SECONDS:.0f} s history = {meter.history_frames()} frames", file=sys.stderr, flush=True)
                 is_fallen = bool(confirmed)
                 # The evidence count is shown by the sidebar meter, not drawn on the frame.
                 # At most ONE queued frame signal: a slow GUI cannot accumulate

@@ -1,18 +1,20 @@
 """FallLogDialog class."""
 from .common import *  # shared Qt imports, constants, and helpers
+from .fallanalysis import PRIORITY_STYLE
 from .falllog import FallLog
 
 class FallLogDialog(QDialog):
     """Window listing this device's fall events; an ongoing fall is shown live on top."""
-    COLUMNS = ("Fall detected at", "Ended at", "Duration", "Person", "After the fall", "Help", "Alarm",
-               "Location", "Location source", "Ended by")
-    LOCATION_COLUMN = 7
+    COLUMNS = ("Fall detected at", "Ended at", "Duration", "Person", "Priority", "Type", "After the fall", "Help",
+               "Alarm", "Location", "Location source", "Ended by")
+    LOCATION_COLUMN = 9
+    PRIORITY_COLUMN = 4
 
     def __init__(self, log: FallLog, parent=None):
         super().__init__(parent)
         self.log = log
         self.setWindowTitle(f"Fall log · {log.device}")
-        self.resize(1240, 520)
+        self.resize(1400, 540)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(20, 18, 20, 18)
         layout.setSpacing(10)
@@ -86,6 +88,8 @@ class FallLogDialog(QDialog):
                 "helped_by": ";".join(str(i) for i in current["helpers"]),
                 "help_after_seconds": (f"{current['help_after']:.0f}"
                                        if current["help_after"] is not None else ""),
+                **FallLog.type_fields(current),
+                "priority": self.log.priority_now(),
             }, True))
         entries += [(row, False) for row in rows]
         self.table.setRowCount(len(entries))
@@ -104,13 +108,16 @@ class FallLogDialog(QDialog):
             ids = [i for i in (row.get("person_ids") or "").split(";") if i]
             person = ", ".join(f"#{i}" for i in ids) if ids else "—"  # older rows have no IDs
             values = (row.get("fall_detected_at", ""), row.get("ended_at", ""), row.get("duration", ""),
-                      person, row.get("after_fall") or "—", FallLog.help_text(row), alarm, location,
+                      person, (row.get("priority") or "—").capitalize(), FallLog.type_text(row),
+                      row.get("after_fall") or "—", FallLog.help_text(row), alarm, location,
                       row.get("location_source", ""),
                       row.get("ended_by", ""))
             for c, value in enumerate(values):
                 item = QTableWidgetItem(value)
                 if ongoing:
                     item.setBackground(alert_bg)
+                if c == self.PRIORITY_COLUMN and row.get("priority") in PRIORITY_STYLE:
+                    item.setForeground(QColor(PRIORITY_STYLE[row["priority"]][3]))
                 self.table.setItem(r, c, item)
         self.table.setVisible(bool(entries))
         self.empty.setVisible(not entries)

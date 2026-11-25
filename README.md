@@ -32,7 +32,7 @@ the only optional network use is a text alert to caregivers on Discord.
 - `app_modules/camerathread.py`, `locationfeed.py`, `falllog.py`, and `alarmsound.py` — background camera, location, logging, and alarm components.
 - `app_modules/caregivers.py` — optional Discord caregiver alerts: sender, message format and setup window.
 - `app_modules/tracking.py` — per-person tracking (`PersonTracker`): IDs and each person's 5-frame fall check.
-- `app_modules/fallanalysis.py` — groundwork for fall analysis: each person's last 5 s of keypoints (`PoseHistory`, measured in torso lengths so near and far people compare) and the detector's real frame rate (`FrameRateMeter`).
+- `app_modules/fallanalysis.py` — fall analysis: each person's last 8 s of keypoints (`PoseHistory`, measured in torso lengths so near and far people compare) and the detector's real frame rate (`FrameRateMeter`), movement after a fall, people around, sudden vs gradual and the priority of each fall.
 - `app_modules/falllogdialog.py` and the UI component modules (`videoview.py`, `evidencemeter.py`, `stattile.py`, `logomark.py`) — focused behavior and widgets.
 - `app_modules/common.py` — shared settings, constants, Qt imports, and helper functions.
 
@@ -192,6 +192,35 @@ no-movement alert — and the Fall log window shows *After the fall*. Older logs
 are upgraded automatically. This is camera analysis, not a medical diagnosis;
 the siren still follows the alarm delay you set.
 
+### Sudden or gradual, and how urgent
+
+When a fall is confirmed, Vertebrate times how long the hips took to go from
+standing height to the floor (from the last 8 seconds of that person's poses):
+
+- **Sudden** — down in under 1.5 s (a trip, slip or collapse).
+- **Gradual** — slower (sinking down, sliding off a chair, sitting down first).
+  Between 1 and 2 s the label adds *borderline*.
+- **Unclear** — the person was not seen standing first, the hips hardly dropped,
+  or the frame rate was too low to time it.
+
+Each fall then gets a **priority**, shown in the banner colour, the Discord
+title and colour, and the fall log:
+
+| Priority | When |
+|---|---|
+| 🔴 Critical | No movement for 15 s |
+| 🟠 Urgent | Sudden fall, or type unclear |
+| 🟡 Check | Gradual fall (slow, controlled descent) |
+| 🟢 Recovered | Got up |
+
+The first Discord alert waits up to 1.5 s after the fall is confirmed so it can
+say how the person fell, e.g. "🟠 URGENT — Sudden fall — Person #2", with
+*Priority*, *How they fell* and *People around* fields. It is sent at once if
+anything else needs to go out first. The fall log adds *fall type*, *descent
+seconds* and the *highest priority* the fall reached; the Fall log window shows
+*Priority* and *Type*. Priority does not change the siren, which follows the
+alarm delay you set.
+
 ### People around a fallen person
 
 While someone is down, Vertebrate also looks at everyone else in view:
@@ -223,11 +252,10 @@ prints the same every 10 seconds as `[performance] …`, and each camera session
 adds one row to `runtime/logs/performance/<device>.csv` (median and slowest
 rate, model time, frame size, system). Numbers only; never images.
 
-Each tracked person also keeps their last 5 seconds of keypoints. Positions are
+Each tracked person also keeps their last 8 seconds of keypoints. Positions are
 measured in torso lengths (shoulders to hips), so a movement means the same
-whether the person is near or far from the camera. This history does not
-change any alert yet; it is the base for the planned fall analysis (movement
-after a fall, people nearby, sudden vs gradual falls).
+whether the person is near or far from the camera. The fall analysis below
+(movement after a fall, people nearby, sudden vs gradual) is built on it.
 
 ## Workspace after cleanup
 

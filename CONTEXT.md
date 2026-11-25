@@ -117,7 +117,7 @@ specified.
 `app_modules/fallanalysis.py` holds the base for the planned fall analysis.
 `PersonTracker.update(boxes, fallen, keypoints, states, timestamp)` appends each
 matched person's keypoints to their `Track.history` (`PoseHistory`, a 5 s ring
-buffer by time, capped at 300 samples). A missed frame adds no sample; it only
+buffer by time, 8 s since phase 3, capped at 480 samples). A missed frame adds no sample; it only
 trims old ones. `PoseHistory.normalized()` gives positions in torso lengths from
 the hip centre at the start of the window (image y points down, so a fall is y
 increasing); the body scale is the median torso length of standing frames.
@@ -153,6 +153,33 @@ update. A fall whose people got up (and none is lying still) ends as
 synthetic poses with keypoint wobble (still person far away: worst score 0.14),
 not yet on real footage; tune them in `fallanalysis.py`. Video labels must stay
 ASCII (OpenCV's Hershey font).
+
+### Sudden vs gradual and priority (phase 3)
+
+`fallanalysis.descent_analysis(history)` uses the hip centre's y over the pose
+history (8 s): standing level = median of the highest standing-frame hip
+positions (within 0.3 torso of the top), floor level = median of the last 3
+frames. Drop < 0.6 torso lengths, no standing frame, no complete 10 %→90 %
+crossing, or a frame gap > 0.75 s during it → `unclear` with a reason. Otherwise
+the last complete crossing is timed with interpolation and divided by
+`DESCENT_SHARE` 0.65 (accelerating/decelerating falls spend ~65 % of the time in
+the middle 80 % of the drop). Sudden < 1.5 s; borderline 1–2 s. Checked on
+synthetic falls of 0.4–5 s at 8 and 15 fps (within ~10 %). `PostFallWatch`
+measures at confirmation and re-measures for `TYPE_SETTLE_S` 1.5 s, then fixes
+it (`type_final`). `priority_of(report)`: recovered → `recovered`; still (or
+critical and not moving now) → `critical`; gradual and not borderline →
+`check`; otherwise `urgent`. Reports add `fall_type`, `descent_s`, `borderline`,
+`type_note`, `type_final`, `priority`. `PRIORITY_STYLE` maps priority → emoji,
+word, Discord colour, window colour. `FallLog` keeps per-person types, the
+highest priority reached (`priority` log field; recovered excluded) and the
+current one (`priority_now()`); `types_final()` releases the first alert.
+`MainWindow` holds the first Discord alert in `_start_pending` until the types
+are final or 1.5 s passed; `_send_caregiver()` flushes it before any other
+message and takes a `priority` for the embed colour (`caregiver_embed(color=)`).
+The banner colour and title follow `priority_now()`. Log fields added:
+`fall_type`, `descent_seconds`, `priority`; Fall log window columns Priority
+(coloured) and Type. Known limits: at very low frame rates a fast fall can
+change the tracker ID, giving `unclear`; falls from sitting are `unclear`.
 
 ### People around a fallen person (phase 2)
 

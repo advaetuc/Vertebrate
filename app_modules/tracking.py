@@ -40,7 +40,7 @@ class Track:
         self.box = tuple(map(float, box))
         self.streak = 0   # consecutive fallen frames of THIS person, capped at CONSECUTIVE_FRAMES
         self.misses = 0   # consecutive frames this person was not detected
-        self.history = PoseHistory()  # ~5 s of this person's keypoints (fallanalysis.py)
+        self.history = PoseHistory()  # last ~8 s of this person's keypoints (fallanalysis.py)
         self.watch: PostFallWatch | None = None  # what they do after a confirmed fall
         self.helping = False  # kneeling/crouching beside someone who fell (not a fall)
 

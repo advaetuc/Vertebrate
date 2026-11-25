@@ -1,15 +1,16 @@
 """Fall analysis: per-person pose history and frame-rate measurement (phase 0),
 the watch after a confirmed fall: is the person moving, lying still, or
-back on their feet? (phase 1), and who else is around them: nearby, coming
-over, or already with them (phase 2). Later phases (sudden vs gradual, fall
-patterns) build on the same history.
+back on their feet? (phase 1), who else is around them: nearby, coming
+over, or already with them (phase 2), and how the fall happened -- sudden or
+gradual -- with a priority for each fall (phase 3). Phase 4 (fall patterns)
+builds on the same history.
 Pure Python + NumPy, same on Windows and macOS. Worker thread only."""
 from .common import *  # shared Qt imports, constants, and helpers
 import warnings
 
 # Pose history ---------------------------------------------------------------
-HISTORY_SECONDS = 5.0        # how far back each person's pose history reaches
-HISTORY_MAX_SAMPLES = 300    # hard cap per person (60 fps x 5 s), whatever the frame rate
+HISTORY_SECONDS = 8.0        # how far back each person's pose history reaches (a slow fall fits)
+HISTORY_MAX_SAMPLES = 480    # hard cap per person (60 fps x 8 s), whatever the frame rate
 SHOULDERS = (5, 6)           # COCO keypoint indices (HIPS is in common.py)
 MIN_TORSO_PX = 8.0           # a shorter shoulder-hip distance is too unreliable to scale by
 
@@ -266,6 +267,114 @@ RECOVER_S = 1.0            # standing this long after a fall -> got up
 RECOVER_RISE = 0.8         # ...with the hips this many torso lengths above where they were
 WATCH_KEEP_S = 10.0        # a recovery is still reported this long afterwards
 
+# Sudden vs gradual (phase 3) ------------------------------------------------------
+# Descent time = how long the hips take to go from standing height to the floor,
+# timed between 10 % and 90 % of the drop (then scaled up to the whole drop), so
+# a slow start or a bounce on landing does not distort it. Real falls speed up
+# (and gradual ones also slow down at the end), so the middle 80 % of the drop
+# takes about 65 % of the whole descent, not 80 %.
+DESCENT_SHARE = 0.65       # share of the whole descent spent between 10 % and 90 % of the drop
+SUDDEN_MAX_S = 1.5         # whole descent shorter than this = sudden, longer = gradual
+BORDERLINE_S = (1.0, 2.0)  # descents in this range are labelled "borderline"
+MIN_DROP_TORSOS = 0.6      # the hips must drop at least this much to judge the speed
+MAX_FRAME_GAP_S = 0.75     # a longer gap between frames during the drop = cannot time it
+TYPE_SETTLE_S = 1.5        # the type is re-measured for this long after confirmation
+
+# Priority of a fall, highest first. The emoji and words are used on Discord.
+PRIORITIES = ("critical", "urgent", "check", "recovered")
+PRIORITY_STYLE = {          # emoji, word, Discord colour, colour in the window
+    "critical":  ("🔴", "CRITICAL", 0xB0102A, DANGER),
+    "urgent":    ("🟠", "URGENT", 0xFF8A4C, WARN),
+    "check":     ("🟡", "CHECK", 0xF5B83D, AMBER),
+    "recovered": ("🟢", "RECOVERED", 0x34D399, OK),
+}
+
+
+def descent_analysis(history: PoseHistory) -> dict:
+    """How fast this person went down, from their pose history.
+
+    Returns {"type": "sudden" | "gradual" | "unclear", "descent_s": seconds or
+    None, "drop": torso lengths, "borderline": bool, "reason": text}."""
+    def unclear(reason, drop=0.0):
+        return {"type": "unclear", "descent_s": None, "drop": round(drop, 2), "borderline": False,
+                "reason": reason}
+    points = []  # (time, hip y in pixels, posture state)
+    for sample in history.samples:
+        hips = joint_midpoint(sample.joints, HIPS)
+        if hips is not None:
+            points.append((sample.t, float(hips[1]), sample.state))
+    if len(points) < 4:
+        return unclear("too few frames with the hips visible")
+    scale = history.body_scale()
+    if not scale:
+        return unclear("body size unknown")
+    floor_y = float(np.median([y for _, y, _ in points[-3:]]))
+    upright = [y for _, y, state in points if state == "standing"]
+    if not upright:
+        return unclear("not seen standing before the fall")
+    top = min(upright)
+    stand_y = float(np.median([y for y in upright if y <= top + 0.3 * scale]))
+    drop = (floor_y - stand_y) / scale
+    if drop < MIN_DROP_TORSOS:
+        return unclear("the hips hardly dropped (sitting, or already low)", drop)
+    low = stand_y + 0.1 * (floor_y - stand_y)    # image y grows downwards
+    high = stand_y + 0.9 * (floor_y - stand_y)
+    crossing, last_low = None, None
+    for i, (_, y, _) in enumerate(points):
+        if y <= low:
+            last_low = i
+        elif y >= high and last_low is not None:
+            crossing = (last_low, i)  # keep the last complete descent
+            last_low = None
+    if crossing is None:
+        return unclear("the start of the fall is not in view", drop)
+    i10, i90 = crossing
+    if max(points[i + 1][0] - points[i][0] for i in range(i10, i90)) > MAX_FRAME_GAP_S:
+        return unclear("too few frames during the fall (low frame rate)", drop)
+
+    def when(i, level):  # interpolated time the hips passed `level` between samples i and i+1
+        (t0, y0, _), (t1, y1, _) = points[i], points[i + 1]
+        return t0 if y1 == y0 else t0 + (t1 - t0) * (level - y0) / (y1 - y0)
+    i10_end = next(i for i in range(i10, i90) if points[i + 1][1] > low)
+    i90_start = max(i for i in range(i10, i90) if points[i][1] < high)
+    seconds = (when(i90_start, high) - when(i10_end, low)) / DESCENT_SHARE
+    seconds = max(seconds, 0.0)
+    return {
+        "type": "sudden" if seconds < SUDDEN_MAX_S else "gradual",
+        "descent_s": round(seconds, 2),
+        "drop": round(drop, 2),
+        "borderline": BORDERLINE_S[0] <= seconds <= BORDERLINE_S[1],
+        "reason": "",
+    }
+
+
+def fall_type_text(report: dict) -> str:
+    """'Sudden fall (down in 0.6 s)', 'Gradual fall (down in 3.2 s)', 'Fall type unclear'."""
+    kind = report.get("fall_type", "unclear")
+    if kind == "unclear" or report.get("descent_s") is None:
+        return "Fall type unclear"
+    text = f"{kind.capitalize()} fall (down in {report['descent_s']:.1f} s"
+    return text + (", borderline)" if report.get("borderline") else ")")
+
+
+def priority_of(report: dict) -> str:
+    """Priority for one fallen person (phase 3 rules; phase 4 refines them):
+    got up -> recovered; lying still -> critical; sudden or unclear -> urgent;
+    gradual -> check (a slow, controlled descent)."""
+    if report.get("status") == "recovered":
+        return "recovered"
+    if report.get("status") == "still" or (report.get("critical") and report.get("status") != "moving"):
+        return "critical"
+    if report.get("fall_type") == "gradual" and not report.get("borderline"):
+        return "check"
+    return "urgent"
+
+
+def highest_priority(priorities) -> str | None:
+    found = [p for p in priorities if p in PRIORITIES]
+    return min(found, key=PRIORITIES.index) if found else None
+
+
 # People around a fallen person (phase 2) ---------------------------------------
 # Distances are between the people's floor points (bottom centre of each box),
 # in the fallen person's torso lengths. A standing adult is about 3 torso lengths
@@ -323,7 +432,7 @@ class PostFallWatch:
     __slots__ = ("confirmed_at", "last_t", "still_s", "longest_still_s", "moved", "last_move_t",
                  "critical_at", "moved_after_critical", "standing_since", "recovered_at",
                  "fall_hip_y", "scale", "above", "bystanders", "helpers", "helped_at",
-                 "nearby_since", "ever_nearby")
+                 "nearby_since", "ever_nearby", "descent", "type_final")
 
     def __init__(self, t: float, history: PoseHistory):
         self.confirmed_at = self.last_t = t
@@ -344,10 +453,17 @@ class PostFallWatch:
         self.helped_at = None                  # when the first helper reached them
         self.nearby_since = None               # when someone was first nearby
         self.ever_nearby: set[int] = set()
+        self.descent = descent_analysis(history)  # sudden / gradual, measured at confirmation
+        self.type_final = False                   # re-measured for TYPE_SETTLE_S, then fixed
 
     def update(self, t: float, history: PoseHistory, seen: bool) -> None:
         dt = min(max(t - self.last_t, 0.0), MOVE_MAX_GAP_S)
         self.last_t = t
+        if not self.type_final:
+            # The hips may still be settling when the fall is confirmed: re-measure briefly.
+            if seen:
+                self.descent = descent_analysis(history)
+            self.type_final = t - self.confirmed_at >= TYPE_SETTLE_S
         latest = history.latest
         if not seen or latest is None or latest.t != t or self.recovered_at is not None:
             return
@@ -464,7 +580,7 @@ class PostFallWatch:
 
     def report(self, t: float) -> dict:
         """Plain values for the GUI thread (sent with each frame)."""
-        return {
+        report = {
             "status": self.status(t),
             "still_s": round(self.still_s, 1),
             "longest_still_s": round(self.longest_still_s, 1),
@@ -473,8 +589,15 @@ class PostFallWatch:
             "critical": self.critical_at is not None,
             "moved_after_critical": self.moved_after_critical,
             "down_s": round((self.recovered_at or t) - self.confirmed_at, 1),
+            "fall_type": self.descent["type"],
+            "descent_s": self.descent["descent_s"],
+            "borderline": self.descent["borderline"],
+            "type_note": self.descent["reason"],
+            "type_final": self.type_final,
             **self.bystander_report(t),
         }
+        report["priority"] = priority_of(report)
+        return report
 
     def bystander_report(self, t: float) -> dict:
         current = self._current(t)
@@ -504,6 +627,12 @@ def watch_label(report: dict | None) -> str:
     if not report:
         return ""
     status = report["status"]
+    kind = report.get("fall_type")
+    prefix = f" ({kind})" if kind in ("sudden", "gradual") else ""
+    return prefix + _status_label(report, status)
+
+
+def _status_label(report: dict, status: str) -> str:
     if status == "still":
         return f" - NO MOVEMENT {report['still_s']:.0f} s"
     if status == "moving":

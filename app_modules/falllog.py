@@ -1,5 +1,6 @@
 """FallLog class."""
 from .common import *  # shared Qt imports, constants, and helpers
+from .fallanalysis import highest_priority
 
 class FallLog:
     """Per-device CSV of confirmed fall alerts. GUI thread only.
@@ -36,7 +37,7 @@ class FallLog:
                                 "moved": False, "longest_still": 0.0, "critical_at": None,
                                 "critical_ids": set(), "moved_again": False, "recovered": {},
                                 "still_now": {}, "nearby": set(), "helpers": [], "help_after": None,
-                                "no_response": False}
+                                "no_response": False, "types": {}, "priority": None, "priority_now": {}}
                 return True
             self.current["people"].update(person_ids)  # someone else may fall during the event
             if self.current["location"] is None and location is not None:
@@ -66,6 +67,13 @@ class FallLog:
         for pid, report in aftermath.items():
             if pid not in event["people"]:
                 continue
+            if report.get("fall_type"):
+                event["types"][pid] = (report["fall_type"], report.get("descent_s"), report.get("borderline", False),
+                                       report.get("type_final", True))
+            if report.get("priority"):
+                event["priority_now"][pid] = report["priority"]
+                if report["priority"] != "recovered":  # the highest priority this fall reached
+                    event["priority"] = highest_priority([event["priority"], report["priority"]])
             event["moved"] |= bool(report["moved"])
             event["longest_still"] = max(event["longest_still"], float(report["longest_still_s"]))
             event["still_now"][pid] = report["status"] == "still"
@@ -146,6 +154,8 @@ class FallLog:
             "people_nearby": ";".join(str(i) for i in sorted(event["nearby"])),
             "helped_by": ";".join(str(i) for i in event["helpers"]),
             "help_after_seconds": f"{event['help_after']:.0f}" if event["help_after"] is not None else "",
+            **self.type_fields(event),
+            "priority": event["priority"] or "",
         }
         self.last_finished = {**row, "location": location, "seconds": seconds, "people": sorted(event["people"])}
         try:
@@ -175,6 +185,37 @@ class FallLog:
         if event["moved"]:
             return "Moved"
         return "Not judged"
+
+    def priority_now(self) -> str:
+        """The ongoing fall's current priority (highest among its people)."""
+        if self.current is None:
+            return "urgent"
+        return highest_priority(self.current["priority_now"].values()) or "urgent"
+
+    def types_final(self) -> bool:
+        """True once the fall type of everyone in the ongoing fall is measured."""
+        event = self.current
+        return event is not None and bool(event["types"]) and all(
+            event["types"].get(pid, (None, None, False, False))[3] for pid in event["people"])
+
+    @staticmethod
+    def type_fields(event: dict) -> dict:
+        """Log fields for the fall type: the first person's (most falls have one)."""
+        if not event["types"]:
+            return {"fall_type": "", "descent_seconds": ""}
+        pid = min(event["types"])
+        kind, seconds, borderline, _final = event["types"][pid]
+        label = kind + (" (borderline)" if borderline and kind != "unclear" else "")
+        return {"fall_type": label, "descent_seconds": f"{seconds:.1f}" if seconds is not None else ""}
+
+    @staticmethod
+    def type_text(row: dict) -> str:
+        """'Sudden · 0.6 s', 'Gradual · 3.1 s', 'Unclear', or '—' for older rows."""
+        kind = row.get("fall_type") or ""
+        if not kind:
+            return "—"
+        seconds = row.get("descent_seconds")
+        return kind.capitalize() + (f" · {seconds} s" if seconds else "")
 
     @staticmethod
     def help_text(row: dict) -> str:

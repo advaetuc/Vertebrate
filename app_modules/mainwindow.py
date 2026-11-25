@@ -6,6 +6,7 @@ from .caregivers import (
     CaregiverDialog, DiscordNotifier, caregiver_config_problem, caregiver_embed,
 )
 from .evidencemeter import EvidenceMeter
+from .fallanalysis import HISTORY_SECONDS, PRIORITY_STYLE, TYPE_SETTLE_S, fall_type_text
 from .falllog import FallLog
 from .falllogdialog import FallLogDialog
 from .locationfeed import LocationFeed
@@ -26,6 +27,8 @@ class MainWindow(QMainWindow):
         self._people = 0
         self._leader_id = 0  # person closest to a confirmed fall (0 = none)
         self._aftermath = {}  # {person ID: post-fall report} from the camera thread
+        self._start_pending = None  # monotonic time a fall started; its first Discord alert waits
+                                    # (up to TYPE_SETTLE_S) until sudden/gradual is measured
         self._frame_times = deque(maxlen=30)
         self._detect_fps = None  # frames the detector processes per second (camera thread)
         self._falls_today = 0
@@ -403,20 +406,24 @@ class MainWindow(QMainWindow):
         self.video.set_border(border[0], border[1], live)
 
         still = self.fall_log.still_people()
-        if state == "fall" and still:
-            self.banner_title.setText(f"No movement — {people_text(still).lower()} lying still")
-            self.banner_detail.setText(self._fall_detail() + " Check on them now.")
+        if state == "fall":
+            priority = self.fall_log.priority_now()
+            tone = PRIORITY_STYLE[priority][3]
+            word = PRIORITY_STYLE[priority][1].capitalize()
+            kind = self._type_text()
+            what = kind.split(" (")[0] if kind and not kind.startswith("Fall type") else "Fall detected"
+            if still:
+                self.banner_title.setText(f"{word} · No movement — {people_text(still).lower()} lying still")
+                self.banner_detail.setText(self._fall_detail() + " Check on them now.")
+            else:
+                self.banner_title.setText(f"{word} · {what} — {self._who().lower()}")
+                self.banner_detail.setText(self._fall_detail())
             self.banner.setStyleSheet(
-                f"QFrame#banner {{ background: {rgba(DANGER, .18)}; border: 1px solid {rgba(DANGER, .70)};"
+                f"QFrame#banner {{ background: {rgba(tone, .16)}; border: 1px solid {rgba(tone, .62)};"
                 f" border-radius: 14px; }} QLabel {{ color: {TEXT}; }}")
-            self.banner_icon.setStyleSheet(f"color: #FFFFFF; background: {DANGER}; border-radius: 18px;")
-        elif state == "fall":
-            self.banner_title.setText(f"Fall detected — {self._who().lower()}")
-            self.banner_detail.setText(self._fall_detail())
-            self.banner.setStyleSheet(
-                f"QFrame#banner {{ background: {rgba(WARN, .13)}; border: 1px solid {rgba(WARN, .55)};"
-                f" border-radius: 14px; }} QLabel {{ color: {TEXT}; }}")
-            self.banner_icon.setStyleSheet(f"color: #1A0E06; background: {WARN}; border-radius: 18px;")
+            self.banner_icon.setStyleSheet(
+                f"color: {'#FFFFFF' if priority == 'critical' else '#1A0E06'}; background: {tone};"
+                f" border-radius: 18px;")
         elif state == "alarm":
             self.banner_title.setText(f"EMERGENCY ALARM — {self._who().lower()} down for "
                                       f"{format_duration(self.fall_log.ongoing_seconds())}")
@@ -505,6 +512,7 @@ class MainWindow(QMainWindow):
         self._detect_fps = None
         self._people = 0
         self._leader_id = 0
+        self._start_pending = None
         self._aftermath = {}
         self.meter.set_value(0)
         self.start_button.setEnabled(False)
@@ -548,10 +556,14 @@ class MainWindow(QMainWindow):
             if self.fall_log.update(is_fallen, self.location.current_fix(), confirmed_ids):
                 self.log_changed()
                 if not was_falling and self.fall_log.current is not None:
-                    self.notify_fall_started()
+                    self._start_pending = time.monotonic()
                 elif was_falling and self.fall_log.current is None:
                     self.notify_fall_ended()
-            for change in self.fall_log.note_aftermath(aftermath):
+            changes = self.fall_log.note_aftermath(aftermath)
+            if self._start_pending is not None and (
+                    self.fall_log.types_final() or time.monotonic() - self._start_pending >= TYPE_SETTLE_S):
+                self._flush_start()
+            for change in changes:
                 if change == "critical":
                     self.notify_no_movement()
                     self.log_changed()
@@ -585,7 +597,7 @@ class MainWindow(QMainWindow):
             return
         self._detect_fps = fps
         self.stat_fps.setToolTip(f"Detection rate {fps:.1f} frames/s · model {inference_ms:.0f} ms per frame\n"
-                                 f"A 5-second pose history holds {history_frames} frames per person.")
+                                 f"A {HISTORY_SECONDS:.0f}-second pose history holds {history_frames} frames per person.")
 
     @Slot(str)
     def show_error(self, message):
@@ -611,6 +623,7 @@ class MainWindow(QMainWindow):
         self._stopping = False
         self._people = 0
         self._leader_id = 0
+        self._start_pending = None
         self._aftermath = {}
         self._frame_times.clear()
         self._detect_fps = None
@@ -702,11 +715,36 @@ class MainWindow(QMainWindow):
 
     # -- caregiver alerts ----------------------------------------------------
     def _send_caregiver(self, kind: str, title: str, description: str, location, mention: bool,
-                        extra_fields=None) -> None:
-        embed = caregiver_embed(kind, self.fall_log.device, title, description, location, extra_fields)
+                        extra_fields=None, priority: str | None = None) -> None:
+        if kind != "test":
+            self._flush_start()  # the first fall alert always goes out first
+        color = PRIORITY_STYLE[priority][2] if priority in PRIORITY_STYLE else None
+        embed = caregiver_embed(kind, self.fall_log.device, title, description, location, extra_fields, color)
         if self.notifier.send(kind, embed, mention):
             self._last_notice = (datetime.now().strftime("%H:%M:%S"), None, "Sending…", "alert")
             self.refresh_caregiver_card()
+
+    def _flush_start(self) -> None:
+        """Send the first alert of the ongoing fall if it is still waiting."""
+        if self._start_pending is None:
+            return
+        self._start_pending = None
+        if self.fall_log.current is not None:
+            self.notify_fall_started()
+
+    def _type_text(self) -> str:
+        """'Sudden fall (down in 0.6 s)' for the first person in the ongoing fall."""
+        current = self.fall_log.current
+        if current is None:
+            return ""
+        for pid in sorted(current["people"]):
+            if pid in self._aftermath:
+                return fall_type_text(self._aftermath[pid])
+        return ""
+
+    def _priority_title(self, priority: str, what: str) -> str:
+        emoji, word = PRIORITY_STYLE[priority][:2]
+        return f"{emoji} {word} — {what} — {self._who()}"
 
     def notify_fall_started(self) -> None:
         current = self.fall_log.current
@@ -715,11 +753,17 @@ class MainWindow(QMainWindow):
         follow = (f"The alarm will ring in {format_duration(delay)} if they stay down." if delay
                   else "The alarm on the device is off.")
         help_text = self._help_text()
+        priority = self.fall_log.priority_now()
+        kind = self._type_text()
+        what = kind.split(" (")[0] if kind and not kind.startswith("Fall type") else "Fall detected"
+        fields = [{"name": "Priority", "value": PRIORITY_STYLE[priority][1].capitalize(), "inline": True},
+                  {"name": "How they fell", "value": kind or "Fall type unclear", "inline": True}]
+        if help_text:
+            fields.append({"name": "People around", "value": help_text, "inline": True})
         self._send_caregiver(
-            "fall", f"⚠️ Fall detected — {self._who()}",
-            f"A fall was detected on **{self.fall_log.device}** at {when}. "
-            + (f"**{help_text}** " if help_text else "") + follow,
-            current["location"], mention=True)
+            "fall", self._priority_title(priority, what),
+            f"A fall was detected on **{self.fall_log.device}** at {when}. " + follow,
+            current["location"], mention=True, extra_fields=fields, priority=priority)
 
     def notify_alarm(self) -> None:
         current = self.fall_log.current
@@ -745,8 +789,11 @@ class MainWindow(QMainWindow):
             "They may be unconscious. " + (f"**{self._help_text()}** " if self._help_text() else "")
             + "Please check on them immediately or call emergency services.",
             current["location"], mention=True,
-            extra_fields=[{"name": "Note", "value": "Movement judged from camera analysis — not a medical "
-                                                     "diagnosis.", "inline": False}])
+            extra_fields=[{"name": "How they fell", "value": self._type_text() or "Fall type unclear",
+                           "inline": True},
+                          {"name": "Note", "value": "Movement judged from camera analysis — not a medical "
+                                                     "diagnosis.", "inline": False}],
+            priority="critical")
 
     def notify_moving_again(self) -> None:
         current = self.fall_log.current
@@ -756,7 +803,7 @@ class MainWindow(QMainWindow):
             "fall", f"🟠 Update — {self._who()} moving again",
             f"After lying still, {self._who().lower()} is moving again on **{self.fall_log.device}**, "
             f"but is still down ({format_duration(self.fall_log.ongoing_seconds())}). Please still check on them.",
-            current["location"], mention=False)
+            current["location"], mention=False, priority=self.fall_log.priority_now())
 
     def notify_helper(self) -> None:
         current = self.fall_log.current
@@ -769,7 +816,7 @@ class MainWindow(QMainWindow):
             f"Person {helper} reached {self._who().lower()} on **{self.fall_log.device}**"
             + (f" {format_duration(after)} after the fall" if after is not None else "")
             + ". The alert stays on until they are back on their feet.",
-            current["location"], mention=False)
+            current["location"], mention=False, priority=self.fall_log.priority_now())
 
     def notify_no_response(self) -> None:
         current = self.fall_log.current
@@ -782,7 +829,7 @@ class MainWindow(QMainWindow):
             f"{self._who().lower()} on **{self.fall_log.device}** but nobody has gone to them "
             f"(down for {format_duration(self.fall_log.ongoing_seconds())}). They may not have noticed — "
             "please check on them.",
-            current["location"], mention=True)
+            current["location"], mention=True, priority=self.fall_log.priority_now())
 
     def notify_fall_ended(self) -> None:
         row = self.fall_log.last_finished
@@ -795,6 +842,10 @@ class MainWindow(QMainWindow):
             if row.get("alarm_silenced_at"):
                 alarm += f", silenced {row['alarm_silenced_at'][-8:]}"
             extra.append({"name": "Alarm", "value": alarm, "inline": True})
+        if row.get("fall_type"):
+            extra.append({"name": "How they fell", "value": FallLog.type_text(row), "inline": True})
+        if row.get("priority"):
+            extra.append({"name": "Highest priority", "value": row["priority"].capitalize(), "inline": True})
         if row.get("after_fall"):
             extra.append({"name": "After the fall", "value": row["after_fall"], "inline": True})
             extra.append({"name": "Help", "value": FallLog.help_text(row), "inline": True})
@@ -804,7 +855,7 @@ class MainWindow(QMainWindow):
                 f"{people_text(row.get('people', []))} got up again on **{self.fall_log.device}** after being "
                 f"down for {row['duration']} ({row['fall_detected_at'][-8:]}–{row['ended_at'][-8:]}). "
                 "No further alert for this fall.",
-                row["location"], mention=False, extra_fields=extra)
+                row["location"], mention=False, extra_fields=extra, priority="recovered")
             return
         self._send_caregiver(
             "end", f"✅ Fall ended — {people_text(row.get('people', []))}",

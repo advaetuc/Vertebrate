@@ -212,7 +212,7 @@ class DiscordNotifier(QObject):
 
 
 def caregiver_embed(kind: str, device: str, title: str, description: str, location=None,
-                    extra_fields: list | None = None) -> dict:
+                    extra_fields: list | None = None, color: int | None = None) -> dict:
     """A Discord embed: coloured card with title, text, location and a map link."""
     fields = list(extra_fields or [])
     if location is not None:
@@ -223,8 +223,9 @@ def caregiver_embed(kind: str, device: str, title: str, description: str, locati
                                 f"\nvia {source}", "inline": False})
     elif kind != "test":
         fields.append({"name": "Location", "value": "Not available on this device", "inline": False})
-    color = {"fall": COLOR_FALL, "alarm": COLOR_ALARM, "critical": COLOR_CRITICAL,
-             "end": COLOR_ENDED}.get(kind, COLOR_TEST)
+    if color is None:  # otherwise the fall's priority colour (fallanalysis.PRIORITY_STYLE)
+        color = {"fall": COLOR_FALL, "alarm": COLOR_ALARM, "critical": COLOR_CRITICAL,
+                 "end": COLOR_ENDED}.get(kind, COLOR_TEST)
     return {
         "title": title[:256],
         "description": description[:4000],
