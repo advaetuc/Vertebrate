@@ -208,9 +208,9 @@ title and colour, and the fall log:
 
 | Priority | When |
 |---|---|
-| 🔴 Critical | No movement for 15 s, or a collapse |
-| 🟠 Urgent | Sudden fall, or type unclear |
-| 🟡 Check | Gradual fall (slow, controlled descent) |
+| 🔴 Critical | No movement for 15 s, a collapse, or a hand to the chest before a gradual fall |
+| 🟠 Urgent | Sudden fall, unsteady before falling, or pattern unclear |
+| 🟡 Check | Slow, controlled descent |
 | 🟢 Recovered | Got up |
 
 The first Discord alert waits up to 1.5 s after the fall is confirmed so it can
@@ -240,8 +240,24 @@ moves). The Discord alert's title names the pattern ("🔴 CRITICAL — Collapse
 Person #2") and adds *What it may mean* and *Signs* fields; the video label
 shows `(collapse)`, `(slip)` or `(trip)`; the fall log records the pattern
 and the signs. These are patterns seen by a camera, **not a medical
-diagnosis**. Patterns of gradual falls (hand to chest, unsteady, controlled)
-are the next step (phase 5B).
+diagnosis**.
+
+### How a gradual fall happened: hand to chest, unsteady, or controlled
+
+For a **gradual** fall, Vertebrate looks at the 3 seconds before the person
+started going down and at the descent itself:
+
+| Pattern | Typical signs | Priority | What it may mean |
+|---|---|---|---|
+| **Hand to chest** | A hand held at the chest for 1 s or more, before or while going down | 🔴 Critical | Possible chest pain or breathing trouble |
+| **Unsteady before falling** | Swaying side to side, or arms out as if reaching for support | 🟠 Urgent | Possible dizziness, weakness, or low blood pressure or sugar |
+| **Slow, controlled descent** | A smooth descent, or sitting down first | 🟡 Check | May have sat or lain down on purpose, or felt faint |
+| **Unclear** | Anything else | 🟠 Urgent | — |
+
+A gradual fall that fits none of these is now Urgent (it used to be Check):
+when unsure, Vertebrate errs on the side of caution. Holding a phone or a cup
+at chest height can look like a hand on the chest; turn to the person, not the
+label.
 
 ### People around a fallen person
 

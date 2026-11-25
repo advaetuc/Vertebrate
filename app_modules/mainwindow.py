@@ -791,8 +791,14 @@ class MainWindow(QMainWindow):
         if help_text:
             fields.append({"name": "People around", "value": help_text, "inline": True})
         fields += self._pattern_fields()
-        if self._first_report().get("pattern") == "collapse":
+        pattern = self._first_report().get("pattern")
+        if pattern == "collapse":
             follow = "They did not try to break the fall — please check on them immediately. " + follow
+        elif pattern == "chest":
+            follow = ("They held a hand to their chest before going down — please check on them immediately "
+                      "and be ready to call emergency services. " + follow)
+        elif pattern == "unsteady":
+            follow = "They looked unsteady before going down. " + follow
         self._send_caregiver(
             "fall", self._priority_title(priority, what),
             f"A fall was detected on **{self.fall_log.device}** at {when}. " + follow,

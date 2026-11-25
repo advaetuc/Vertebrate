@@ -184,7 +184,7 @@ change the tracker ID, giving `unclear`; falls from sitting are `unclear`.
 ### Patterns of a sudden fall (phase 5A)
 
 `fallanalysis.fall_pattern(history, descent)` runs only for `sudden` falls
-(gradual → `pattern` None, phase 5B). Window: hips' 10 % time − 0.4 s to 90 %
+(gradual falls: `gradual_pattern()`, phase 5B). Window: hips' 10 % time − 0.4 s to 90 %
 time + 0.6 s (`descent` now carries `t_start` / `t_end`). First contact: for
 each part (`PARTS`: hips, knees, hands = wrists, upper = nose + shoulders) its
 own start (median of the last 4 standing frames) and end (last 3 frames) y; a
@@ -206,6 +206,27 @@ build the text; `PATTERN_TEXT` holds label and meaning. Log fields added:
 and collapses (profile, mirrored, frontal; 8/12/15 fps): all correct with
 1.5 px wobble; with 3 px wobble on a small person 22/27 right, 4 unclear,
 1 collapse read as trip. Not yet checked on real footage.
+
+### Patterns of a gradual fall (phase 5B)
+
+`fallanalysis.gradual_pattern(history, descent)` (called by `fall_pattern()`
+for `gradual` falls) looks at `t_start − 3 s … t_end + 0.5 s`. Hand to chest:
+chest spot = shoulders + 0.35 × (hips − shoulders); a wrist within 0.45 torso;
+longest hold (gaps ≤ 0.3 s bridged) ≥ 1.0 s → `chest` (judged if wrists are
+visible on half the frames). Unsteady: hip x before the descent, 3-frame
+average, zigzag count with 0.2-torso steps ≥ 2 reversals (`sway`; walking one
+way gives 0), or an arm out (≥ 0.8 torso from the shoulder–hip segment) for
+≥ 0.5 s before half-way down (`reaching`). Controlled: hips' smoothed descent
+speed never above 1.6 torso/s (`smooth`), or hips resting ≥ 0.6 s part-way down
+(`sat_first`). Order: chest → unsteady → controlled → unclear. `priority_of`:
+chest → critical (even if moving); controlled and not borderline → check;
+everything else → urgent (gradual-unclear was check in phase 3). Report adds
+`chest_s`, `sway`, `reaching`, `sat_first`, `smooth`; `pattern_detail()` turns
+them into "Signs". Video label for chest is `(hand to chest)` (`VIDEO_LABEL`).
+Checked on keyframed hand-to-chest, swaying/arms-out, smooth sink, sit-on-a-
+chair-first, plain sink and walk-then-sink falls (profile, mirrored, frontal;
+5–15 fps; up to 3 px wobble on a small person): 36/36 and 54/54 right. Known
+limit: a phone or cup held at chest height reads as a hand on the chest.
 
 ### People around a fallen person (phase 2)
 

@@ -3,8 +3,8 @@ the watch after a confirmed fall: is the person moving, lying still, or
 back on their feet? (phase 1), who else is around them: nearby, coming
 over, or already with them (phase 2), and how the fall happened -- sudden or
 gradual -- with a priority for each fall (phase 3), and the pattern of a
-sudden fall: collapse, slip or trip (phase 5A). Phase 5B (patterns of gradual
-falls) builds on the same history.
+sudden fall: collapse, slip or trip (phase 5A), and of a gradual fall: hand to
+chest, unsteady, or a controlled descent (phase 5B).
 Pure Python + NumPy, same on Windows and macOS. Worker thread only."""
 from .common import *  # shared Qt imports, constants, and helpers
 import warnings
@@ -380,21 +380,33 @@ def pattern_detail(report: dict) -> str:
         parts.append("arms reached out")
     elif arms is False:
         parts.append("no arm movement to break the fall")
-    return ("; ".join(parts) + ".").capitalize() if parts else ""
+    if report.get("chest_s"):
+        if report["chest_s"] >= CHEST_MIN_S:
+            parts.append(f"hand held to the chest for {report['chest_s']:.1f} s")
+    if report.get("sway"):
+        parts.append("swaying before the fall")
+    if report.get("reaching"):
+        parts.append("arms out, as if reaching for support")
+    if report.get("pattern") == "controlled":
+        parts.append("sat down first" if report.get("sat_first") else "went down slowly and smoothly")
+    text = "; ".join(parts) + "." if parts else ""
+    return text[:1].upper() + text[1:]
 
 
 def priority_of(report: dict) -> str:
-    """Priority for one fallen person (phase 3 rules, refined by patterns):
-    got up -> recovered; lying still, or a collapse and not moving since ->
-    critical; sudden or unclear -> urgent;
-    gradual -> check (a slow, controlled descent)."""
+    """Priority for one fallen person:
+    got up -> recovered; lying still, a collapse and not moving since, or a
+    hand held to the chest -> critical; a slow, controlled descent -> check;
+    everything else (sudden, unsteady, unclear) -> urgent."""
     if report.get("status") == "recovered":
         return "recovered"
     if report.get("status") == "still" or (report.get("critical") and report.get("status") != "moving"):
         return "critical"
     if report.get("pattern") == "collapse" and report.get("status") != "moving":
         return "critical"  # sudden, no protective reaction: possible loss of consciousness
-    if report.get("fall_type") == "gradual" and not report.get("borderline"):
+    if report.get("pattern") == "chest":
+        return "critical"  # possible chest pain: even if they are moving
+    if report.get("pattern") == "controlled" and not report.get("borderline"):
         return "check"
     return "urgent"
 
@@ -424,7 +436,25 @@ PATTERN_TEXT = {           # label, what it may mean (always "possible": camera 
     "collapse": ("Collapse", "possible loss of consciousness (fainting, seizure or a heart problem)"),
     "slip": ("Possible slip", "fell backwards or onto the hips"),
     "trip": ("Possible trip", "fell forwards and tried to break the fall"),
+    "chest": ("Hand to chest", "possible chest pain or breathing trouble"),
+    "unsteady": ("Unsteady before falling", "possible dizziness, weakness, or low blood pressure or sugar"),
+    "controlled": ("Slow, controlled descent", "may have sat or lain down on purpose, or felt faint"),
 }
+
+VIDEO_LABEL = {"chest": "hand to chest"}  # pattern names on the video (ASCII only)
+
+# Patterns of a gradual fall (phase 5B) ------------------------------------------
+GRADUAL_PRE_S = 3.0        # how long before the hips start dropping is looked at
+CHEST_SPOT = 0.35          # chest = this far from the shoulders towards the hips
+CHEST_RADIUS = 0.45        # a wrist this close (torso lengths) to that spot = hand on chest
+CHEST_MIN_S = 1.0          # ...held at least this long (before or while going down)
+CHEST_GAP_S = 0.3          # a gap this short (a missed wrist) does not break the hold
+SWAY_STEP = 0.2            # torso lengths the hips move one way, then back, to count a sway
+SWAY_MIN_REVERSALS = 2     # left-right-left (walking in one direction is not swaying)
+REACH_MIN_S = 0.5          # arms out (ARM_OUT_TORSOS) this long before half-way down = reaching
+SMOOTH_MAX_SPEED = 1.6     # torso lengths/s: a descent never faster than this is smooth
+SIT_PAUSE_S = 0.6          # hips resting this long part-way down = sat first
+SIT_PAUSE_MOVE = 0.1       # ...moving no more than this (torso lengths)
 
 
 def _distance_to_segment(point, a, b) -> float:
@@ -446,12 +476,123 @@ def _part_track(samples, indices):
     return track
 
 
+def _arm_out(sample: PoseSample, scale: float) -> bool | None:
+    """A wrist well away from the shoulder-hip segment (None if not visible)."""
+    shoulders, hips = joint_midpoint(sample.joints, SHOULDERS), joint_midpoint(sample.joints, HIPS)
+    wrists = [sample.joints[i] for i in (9, 10) if np.isfinite(sample.joints[i]).all()]
+    if shoulders is None or hips is None or not wrists or np.hypot(*(hips - shoulders)) < MIN_TORSO_PX:
+        return None
+    return max(_distance_to_segment(w, shoulders, hips) for w in wrists) / scale >= ARM_OUT_TORSOS
+
+
+def _hand_on_chest(sample: PoseSample, scale: float) -> bool | None:
+    shoulders, hips = joint_midpoint(sample.joints, SHOULDERS), joint_midpoint(sample.joints, HIPS)
+    wrists = [sample.joints[i] for i in (9, 10) if np.isfinite(sample.joints[i]).all()]
+    if shoulders is None or hips is None or not wrists:
+        return None
+    chest = shoulders + CHEST_SPOT * (hips - shoulders)
+    return min(float(np.hypot(*(w - chest))) for w in wrists) / scale <= CHEST_RADIUS
+
+
+def _longest_hold(samples, test) -> float:
+    """Longest stretch of time (s) for which test(sample) is True, bridging short gaps."""
+    best, start, last_true = 0.0, None, None
+    for sample in samples:
+        ok = test(sample)
+        if ok:
+            if start is None or sample.t - last_true > CHEST_GAP_S:
+                start = sample.t
+            last_true = sample.t
+            best = max(best, last_true - start)
+    return best
+
+
+def _reversals(values, step) -> int:
+    """How many times a series turns back after moving at least `step` (a zigzag count).
+    Walking steadily one way gives 0; left-right-left gives 2."""
+    if not values:
+        return 0
+    turns, direction, extreme = 0, 0, values[0]
+    for v in values[1:]:
+        if direction == 0:                      # not moved far enough yet to have a direction
+            if abs(v - values[0]) >= step:
+                direction, extreme = (1 if v > values[0] else -1), v
+        elif (v - extreme) * direction > 0:
+            extreme = v                         # still going the same way
+        elif abs(v - extreme) >= step:
+            turns += 1                          # turned back far enough
+            direction, extreme = -direction, v
+    return turns
+
+
+def gradual_pattern(history: PoseHistory, descent: dict) -> dict:
+    """Pattern of a GRADUAL fall from the seconds before and during the descent:
+    hand held to the chest -> 'chest'; swaying or arms out reaching for
+    support -> 'unsteady'; a smooth descent or sitting first -> 'controlled'."""
+    out = {"pattern": "unclear"}
+    scale = history.body_scale()
+    samples = history.samples
+    if not scale or len(samples) < 6:
+        return out
+    t_start, t_end = descent["t_start"], descent["t_end"]
+    window = [s for s in samples if t_start - GRADUAL_PRE_S <= s.t <= t_end + 0.5]
+    pre = [s for s in window if s.t <= t_start]
+    early = [s for s in window if s.t <= t_start + 0.5 * (t_end - t_start)]  # before half-way down
+    if len(window) < 6:
+        return out
+
+    # 1. Hand to the chest, before or while going down
+    seen = [s for s in window if _hand_on_chest(s, scale) is not None]
+    if len(seen) >= len(window) // 2:
+        out["chest_s"] = round(_longest_hold(window, lambda s: bool(_hand_on_chest(s, scale))), 1)
+
+    # 2. Unsteady: hips swaying side to side, or arms out (reaching for support)
+    hip_x = [float(p[0]) / scale for p in (joint_midpoint(s.joints, HIPS) for s in pre) if p is not None]
+    if len(hip_x) >= 4:
+        smooth_x = [float(np.mean(hip_x[max(0, i - 1):i + 2])) for i in range(len(hip_x))]  # calm the wobble
+        out["sway"] = _reversals(smooth_x, SWAY_STEP) >= SWAY_MIN_REVERSALS
+    arms_seen = [s for s in early if _arm_out(s, scale) is not None]
+    if len(arms_seen) >= max(3, len(early) // 2):
+        out["reaching"] = _longest_hold(early, lambda s: bool(_arm_out(s, scale))) >= REACH_MIN_S
+
+    # 3. Controlled: never fast, or a pause part-way down (sat first)
+    hips = [(s.t, float(p[1]) / scale) for s, p in ((s, joint_midpoint(s.joints, HIPS)) for s in window)
+            if p is not None and t_start - 0.2 <= s.t <= t_end + 0.2]
+    if len(hips) >= 4:
+        ys = np.array([y for _, y in hips]); ts = np.array([t for t, _ in hips])
+        ys = np.convolve(ys, np.ones(3) / 3, mode="same") if len(ys) >= 5 else ys
+        speeds = np.diff(ys[1:-1]) / np.maximum(np.diff(ts[1:-1]), 1e-3) if len(ys) >= 5 else np.diff(ys) / np.maximum(np.diff(ts), 1e-3)
+        out["smooth"] = bool(len(speeds)) and float(np.max(speeds)) <= SMOOTH_MAX_SPEED
+        sat = False
+        for i in range(len(hips)):
+            j = i
+            while j + 1 < len(hips) and abs(hips[j + 1][1] - hips[i][1]) <= SIT_PAUSE_MOVE:
+                j += 1
+            if hips[j][0] - hips[i][0] >= SIT_PAUSE_S and i > 0 and j < len(hips) - 1:
+                sat = True
+                break
+        out["sat_first"] = sat
+
+    if out["chest_s"] is not None and out["chest_s"] >= CHEST_MIN_S:
+        out["pattern"] = "chest"
+    elif out["sway"] or out["reaching"]:
+        out["pattern"] = "unsteady"
+    elif out["sat_first"] or out["smooth"]:
+        out["pattern"] = "controlled"
+    return out
+
+
 def fall_pattern(history: PoseHistory, descent: dict) -> dict:
-    """Pattern of a SUDDEN fall: 'collapse', 'slip', 'trip' or 'unclear'.
-    Gradual falls return pattern None (phase 5B). Returns also first_contact
-    (a PARTS key or None), direction ('forward' / 'backward' / None) and arms
-    (True = reached out, False = did not, None = not visible)."""
-    result = {"pattern": None, "first_contact": None, "direction": None, "arms": None}
+    """Pattern of the fall. Sudden: 'collapse', 'slip', 'trip' or 'unclear';
+    gradual: 'chest', 'unsteady', 'controlled' or 'unclear'; type unclear: None.
+    Also returns the observations behind it: first_contact (a PARTS key or None),
+    direction ('forward' / 'backward' / None), arms (True = reached out, False =
+    did not, None = not visible); for gradual falls chest_s (seconds a hand was
+    on the chest), sway (bool), reaching (bool), sat_first (bool), smooth (bool)."""
+    result = {"pattern": None, "first_contact": None, "direction": None, "arms": None,
+              "chest_s": None, "sway": None, "reaching": None, "sat_first": None, "smooth": None}
+    if descent.get("type") == "gradual" and "t_start" in descent:
+        return {**result, **gradual_pattern(history, descent)}
     if descent.get("type") != "sudden" or "t_start" not in descent:
         return result
     result["pattern"] = "unclear"
@@ -798,7 +939,7 @@ def watch_label(report: dict | None) -> str:
     kind = report.get("fall_type")
     prefix = f" ({kind})" if kind in ("sudden", "gradual") else ""
     if report.get("pattern") in PATTERN_TEXT:
-        prefix = f" ({report['pattern']})"
+        prefix = f" ({VIDEO_LABEL.get(report['pattern'], report['pattern'])})"
     return prefix + _status_label(report, status)
 
 
